@@ -53,3 +53,7 @@ The server also keeps a short in-memory list of live events. The admin account (
 To update: upload the new `server.js` to GitHub, then on Render use Manual Deploy > Deploy latest commit. Check `/api/health`, it now shows `rooms` and `online`.
 
 The server now also passes hits between players, counts team kills per room, and ends a round at 50 kills.
+
+
+## Server list, private servers, chat
+`GET /api/rooms` lists public servers. A join message may include `room` (id), `code` (private code) or `create:1` (new private server). Chat is `{t:'c',m}` and stays inside one server. Admin accounts may be connected from two windows.

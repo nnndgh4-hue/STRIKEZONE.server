@@ -99,15 +99,21 @@ const wsFrame = (str, op) => { const p = Buffer.from(str), n = p.length; let h; 
 const tcOf = r => { const t = [0, 0]; for (const c of r.pl.values()) t[c.tm]++; return t; };
 const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.stringify(o))); } catch (e) { } };
 const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
+const CODES = new Map();   // private code -> room
+function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0] }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
+function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
+function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)]; if (!CODES.has(c)) return c; } return null; }
 function findRoom(team) {
-  for (const r of ROOMS.values()) if (r.pl.size < MAXP && tcOf(r)[team] < MAXT) return r;
-  const r = { id: 'general-' + (++roomN), pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0] }; ROOMS.set(r.id, r); return r;
+  for (const r of ROOMS.values()) if (!r.priv && r.pl.size < MAXP && tcOf(r)[team] < MAXT) return r;
+  return newGeneral();
 }
+const lbOf = r => [...r.pl.values()].map(o => [o.pid, o.k | 0, o.d | 0]);
+function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; for (const o of r.pl.values()) { o.k = 0; o.d = 0; } }
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
   if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); }
   const r = c.room; if (!r) return; r.pl.delete(c.pid);
-  if (!r.pl.size) { ROOMS.delete(r.id); return; }
+  if (!r.pl.size) { ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
   roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
   if (r.host === c.pid) { r.host = r.pl.keys().next().value; roomOut(r, { t: 'h', host: r.host }); }
 }
@@ -120,13 +126,22 @@ function wsMsg(c, m) {
     if (m.t !== 'join' || c.joining) return; c.joining = true;
     store.sessionUser(sha(String(m.token || ''))).then(u => {
       if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
-      const old = USERS.get(u.id); if (old && old !== c) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
-      const team = m.team === 1 ? 1 : 0, r = findRoom(team), pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = tcOf(r)[team] < MAXT ? team : 1 - team; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = isAdmin(u.name);
+      const adm = isAdmin(u.name), old = USERS.get(u.id);
+      const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
+      const team = m.team === 1 ? 1 : 0;
+      let r = null;
+      if (m.create) { const code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); }
+      else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4)); if (!r) return soft('No private server has that code.'); }
+      else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
+      else r = findRoom(team);
+      if (r.pl.size >= MAXP) { if (m.create) ROOMS.delete(r.id); return soft('That server is full (12 players).'); }
+      if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
+      const pid = r.nextId++;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = tcOf(r)[team] < MAXT ? team : 1 - team; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.k = 0; c.d = 0;
       if (!r.host) r.host = pid;
       const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: r.priv ? 1 : 0, code: r.code, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r) });
       roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
     }).catch(() => wsDrop(c));
     return;
@@ -134,7 +149,20 @@ function wsMsg(c, m) {
   const r = c.room, now = Date.now();
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
-    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30) }, c);
+    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(40, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
+  } else if (m.t === 'adm') {
+    if (!c.admin) return;
+    const cm = String(m.c || '');
+    if (cm === 'time') { r.t0 = Math.min(Date.now() - 1000, r.t0 - 60000); if (Date.now() - r.t0 > 570000) r.t0 = Date.now() - 570000; roomOut(r, { t: 'clk', el: Date.now() - r.t0 }); return; }
+    if (!['freeze', 'killred', 'auto', 'follow', 'hold', 'attack', 'defend', 'spread'].includes(cm) || r.host === c.pid) return;
+    const h = r.pl.get(r.host); if (h) wsOut(h, { t: 'adm', c: cm, tm: c.tm, from: c.pid });
+  } else if (m.t === 'fx') {
+    if (now - (c.lf || 0) < 40) return; c.lf = now;
+    roomOut(r, { t: 'fx', i: c.pid, w: Math.max(0, Math.min(40, m.w | 0)) }, c);
+  } else if (m.t === 'c') {
+    const tx = String(m.m || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120);
+    if (!tx || now - (c.lc || 0) < 700) return; c.lc = now;
+    roomOut(r, { t: 'c', i: c.pid, n: c.name, tm: c.tm, m: tx });
   } else if (m.t === 'hit') {
     if (now - c.lh < 12) return; c.lh = now;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
@@ -150,14 +178,15 @@ function wsMsg(c, m) {
     wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'kl') {
     const kt = m.kt === 1 ? 1 : 0; r.sc[kt]++;
-    roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc });
-    if (r.sc[kt] >= 50) { roomOut(r, { t: 'end', win: kt, sc: r.sc }); r.sc = [0, 0]; r.t0 = Date.now(); }
+    const kc = r.pl.get(m.kp | 0); if (kc && kc.tm === kt) kc.k++; if (m.vp) c.d++;
+    roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc, lb: lbOf(r) });
+    if (r.sc[kt] >= 50) { const fin = lbOf(r); roomOut(r, { t: 'end', win: kt, sc: r.sc, lb: fin }); roomReset(r); }
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
-    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0] : [0, 0, 0, 0, 0, 2]) }, c);
+    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0))] : [0, 0, 0, 0, 0, 2, 0]) }, c);
   }
 }
-setInterval(() => { const n = Date.now(); for (const r of ROOMS.values()) if (n - r.t0 >= 603000) { r.t0 = n; r.sc = [0, 0]; } }, 5000).unref();
+setInterval(() => { const n = Date.now(); for (const r of ROOMS.values()) if (n - r.t0 >= 603000) roomReset(r); }, 5000).unref();
 function wsOpen(sock, head) {
   const c = { sock, dead: false, room: null, ls: 0, lb: 0, lh: 0, seen: Date.now() }; let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0), frag = null;
   sock.setNoDelay(true); sock.setTimeout(0);
@@ -190,6 +219,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
     const url = req.url.split('?')[0], ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file', rooms: ROOMS.size, online: USERS.size });
+    if (url === '/api/rooms' && req.method === 'GET') {
+      const now = Date.now(), list = [...ROOMS.values()].filter(r => !r.priv).map(r => ({ id: r.id, name: r.name, n: r.pl.size, tc: tcOf(r), el: now - r.t0, sc: r.sc }));
+      if (!list.some(r => r.n < MAXP)) list.push({ id: '', name: 'NEW GENERAL SERVER', n: 0, tc: [0, 0], el: 0, sc: [0, 0] });
+      return send(res, 200, { rooms: list, max: MAXP, maxTeam: MAXT });
+    }
     if (url === '/api/register' && req.method === 'POST') {
       if (limited(ip)) return send(res, 429, { error: 'Too many attempts. Try again in a few minutes.' });
       const b = await body(req), name = String(b.user || ''), pw = String(b.pass || '');
