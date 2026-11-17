@@ -49,6 +49,9 @@ const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers
 const send = (res, code, obj) => { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, CORS)); res.end(JSON.stringify(obj)); };
 const body = req => new Promise((res, rej) => { let n = 0; const c = []; req.on('data', d => { n += d.length; if (n > MAX_BODY) { rej(new Error('too big')); req.destroy(); } else c.push(d); }); req.on('end', () => { try { res(JSON.parse(Buffer.concat(c).toString() || '{}')); } catch (e) { rej(new Error('bad json')); } }); req.on('error', rej); });
 const hits = new Map();   // simple per-IP limit on login/register
+/* live events: the admin posts one, every player's game polls for new ones (kept in memory for 2 minutes) */
+const EVS = [], EVT = new Set(['boss','superspeed','supergravity','enlarge','meteor','coinrain','disco','tacoparty','infammo','ufo','dev']);
+let evSeq = 0, lastEv = 0;
 const limited = ip => { const now = Date.now(), a = (hits.get(ip) || []).filter(x => now - x < 600000); a.push(now); hits.set(ip, a); return a.length > 25; };
 setInterval(() => { const now = Date.now(); for (const [k, a] of hits) { const f = a.filter(x => now - x < 600000); f.length ? hits.set(k, f) : hits.delete(k); } }, 600000).unref();
 const NAME = /^[A-Za-z0-9_]{3,20}$/;
@@ -88,11 +91,87 @@ function plausible(save, prev, now) {
 }
 
 /* ---------- routes ---------- */
+/* ---------- live play (WebSocket, no extra packages) ---------- */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11', MAXT = 10, MAXP = 12;
+const ROOMS = new Map();   // room id -> { id, pl: Map(pid -> client), host, nextId }
+let roomN = 0;
+const wsFrame = (str, op) => { const p = Buffer.from(str), n = p.length; let h; if (n < 126) h = Buffer.from([0x80 | (op || 1), n]); else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x80 | (op || 1); h[1] = 126; h.writeUInt16BE(n, 2); } else { h = Buffer.alloc(10); h[0] = 0x80 | (op || 1); h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); } return Buffer.concat([h, p]); };
+const tcOf = r => { const t = [0, 0]; for (const c of r.pl.values()) t[c.tm]++; return t; };
+const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.stringify(o))); } catch (e) { } };
+const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
+function findRoom(team) {
+  for (const r of ROOMS.values()) if (r.pl.size < MAXP && tcOf(r)[team] < MAXT) return r;
+  const r = { id: 'general-' + (++roomN), pl: new Map(), host: 0, nextId: 1 }; ROOMS.set(r.id, r); return r;
+}
+function wsDrop(c) {
+  if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
+  if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); }
+  const r = c.room; if (!r) return; r.pl.delete(c.pid);
+  if (!r.pl.size) { ROOMS.delete(r.id); return; }
+  roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
+  if (r.host === c.pid) { r.host = r.pl.keys().next().value; roomOut(r, { t: 'h', host: r.host }); }
+}
+const num = (v, lim) => { v = Number(v); return Number.isFinite(v) ? Math.max(-lim, Math.min(lim, Math.round(v * 100) / 100)) : 0; };
+const USERS = new Map();   // user id -> client (one connection per account)
+function wsMsg(c, m) {
+  if (c.dead || !m || typeof m.t !== 'string') return;
+  if (m.t === 'ping') return wsOut(c, { t: 'pong' });
+  if (!c.room) {
+    if (m.t !== 'join' || c.joining) return; c.joining = true;
+    store.sessionUser(sha(String(m.token || ''))).then(u => {
+      if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
+      const old = USERS.get(u.id); if (old && old !== c) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
+      const team = m.team === 1 ? 1 : 0, r = findRoom(team), pid = r.nextId++;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = tcOf(r)[team] < MAXT ? team : 1 - team; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = isAdmin(u.name);
+      if (!r.host) r.host = pid;
+      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
+      r.pl.set(pid, c);
+      wsOut(c, { t: 'w', id: pid, room: r.id, host: r.host, tm: c.tm, pl: list, tc: tcOf(r) });
+      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
+    }).catch(() => wsDrop(c));
+    return;
+  }
+  const r = c.room, now = Date.now();
+  if (m.t === 's') {
+    if (now - c.ls < 30) return; c.ls = now;
+    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30) }, c);
+  } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
+    if (now - c.lb < 60) return; c.lb = now;
+    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0] : [0, 0, 0, 0, 0, 2]) }, c);
+  }
+}
+function wsOpen(sock, head) {
+  const c = { sock, dead: false, room: null, ls: 0, lb: 0, seen: Date.now() }; let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0), frag = null;
+  sock.setNoDelay(true); sock.setTimeout(0);
+  const t0 = setTimeout(() => { if (!c.room) wsDrop(c); }, 8000);
+  const eat = () => {
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = buf[0] & 0x80, op = buf[0] & 15, masked = buf[1] & 128; let len = buf[1] & 127, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; } else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      if (!masked || len > 65536) return wsDrop(c);
+      if (buf.length < off + 4 + len) return;
+      const mk = buf.subarray(off, off + 4), p = Buffer.from(buf.subarray(off + 4, off + 4 + len)); for (let i = 0; i < len; i++) p[i] ^= mk[i & 3];
+      buf = buf.subarray(off + 4 + len); c.seen = Date.now();
+      if (op === 8) { try { sock.write(wsFrame('', 8)); } catch (e) { } return wsDrop(c); }
+      if (op === 9) { try { sock.write(wsFrame(p.toString(), 10)); } catch (e) { } continue; }
+      if (op === 10) continue;
+      if (op === 0 || op === 1) {
+        frag = op === 1 ? p : Buffer.concat([frag || Buffer.alloc(0), p]); if (frag.length > 65536) return wsDrop(c);
+        if (fin) { let m = null; try { m = JSON.parse(frag.toString()); } catch (e) { } frag = null; if (m) wsMsg(c, m); }
+      }
+    }
+  };
+  sock.on('data', d => { buf = Buffer.concat([buf, d]); try { eat(); } catch (e) { wsDrop(c); } });
+  sock.on('close', () => { clearTimeout(t0); wsDrop(c); }); sock.on('error', () => wsDrop(c));
+  c.timer = setInterval(() => { if (c.dead) return clearInterval(c.timer); if (Date.now() - c.seen > 40000) wsDrop(c); }, 10000); c.timer.unref();
+  eat();
+}
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
     const url = req.url.split('?')[0], ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file' });
+    if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file', rooms: ROOMS.size, online: USERS.size });
     if (url === '/api/register' && req.method === 'POST') {
       if (limited(ip)) return send(res, 429, { error: 'Too many attempts. Try again in a few minutes.' });
       const b = await body(req), name = String(b.user || ''), pw = String(b.pass || '');
@@ -110,6 +189,23 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { token: await startSession(u), user: u.name, admin: isAdmin(u.name) });
     }
     if (url === '/api/logout' && req.method === 'POST') { const h = req.headers.authorization || ''; if (h.startsWith('Bearer ')) await store.delSession(sha(h.slice(7))); return send(res, 200, { ok: true }); }
+    if (url === '/api/event' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), type = String(b.type || '');
+      if (!EVT.has(type)) return send(res, 400, { error: 'Unknown event.' });
+      if (Date.now() - lastEv < 250) return send(res, 429, { error: 'Slow down.' });
+      lastEv = Date.now();
+      const d = b.data && typeof b.data === 'object' ? b.data : {};
+      const data = { on: !!d.on, team: d.team === 1 ? 1 : 0, text: type === 'dev' ? String(d.text || '').slice(0, 140) : '' };
+      const e = { seq: ++evSeq, id: String(b.id || '').slice(0, 40) || 's' + evSeq, type, data, ts: Date.now() };
+      EVS.push(e); while (EVS.length > 100 || (EVS.length && e.ts - EVS[0].ts > 120000)) EVS.shift();
+      return send(res, 200, { ok: true, seq: evSeq });
+    }
+    if (url === '/api/events' && req.method === 'GET') {
+      const since = Number((req.url.split('since=')[1] || '').split('&')[0]), now = Date.now();
+      const list = EVS.filter(e => (since >= 0 ? e.seq > since : now - e.ts < 15000) && now - e.ts < 60000).map(e => ({ seq: e.seq, id: e.id, type: e.type, data: e.data, age: now - e.ts }));
+      return send(res, 200, { seq: evSeq, events: list });
+    }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
       if (req.method === 'GET') { const s = await store.getSave(u.id); return send(res, 200, { user: u.name, admin: isAdmin(u.name), save: s ? JSON.parse(s.data) : null, upd: s ? s.upd : 0 }); }
@@ -125,6 +221,15 @@ const server = http.createServer(async (req, res) => {
     console.error(e.message);
     send(res, e.message === 'too big' ? 413 : e.message === 'bad json' ? 400 : 500, { error: e.message === 'too big' ? 'Save too large.' : e.message === 'bad json' ? 'Bad request.' : 'Server error.' });
   }
+});
+server.on('upgrade', (req, sock, head) => {
+  try {
+    const key = req.headers['sec-websocket-key'];
+    if (req.url.split('?')[0] !== '/ws' || !key) { sock.destroy(); return; }
+    const acc = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+    sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + acc + '\r\n\r\n');
+    wsOpen(sock, head);
+  } catch (e) { try { sock.destroy(); } catch (x) { } }
 });
 store.init().then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
   .catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
