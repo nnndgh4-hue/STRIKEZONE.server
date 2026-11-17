@@ -51,3 +51,5 @@ The server also keeps a short in-memory list of live events. The admin account (
 ## Live play (WebSocket)
 `server.js` now also runs the live game rooms (no extra packages needed). Players connect to `/ws` with their login. Each room holds up to 12 players, at most 10 per team; when a room is full another one opens. One player's game runs the bots for the room, and the server passes positions between everyone. Rooms live in memory only.
 To update: upload the new `server.js` to GitHub, then on Render use Manual Deploy > Deploy latest commit. Check `/api/health`, it now shows `rooms` and `online`.
+
+The server now also passes hits between players, counts team kills per room, and ends a round at 50 kills.

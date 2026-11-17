@@ -101,7 +101,7 @@ const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.st
 const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
 function findRoom(team) {
   for (const r of ROOMS.values()) if (r.pl.size < MAXP && tcOf(r)[team] < MAXT) return r;
-  const r = { id: 'general-' + (++roomN), pl: new Map(), host: 0, nextId: 1 }; ROOMS.set(r.id, r); return r;
+  const r = { id: 'general-' + (++roomN), pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0] }; ROOMS.set(r.id, r); return r;
 }
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
@@ -126,7 +126,7 @@ function wsMsg(c, m) {
       if (!r.host) r.host = pid;
       const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, host: r.host, tm: c.tm, pl: list, tc: tcOf(r) });
+      wsOut(c, { t: 'w', id: pid, room: r.id, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc });
       roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
     }).catch(() => wsDrop(c));
     return;
@@ -135,13 +135,31 @@ function wsMsg(c, m) {
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
     roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30) }, c);
+  } else if (m.t === 'hit') {
+    if (now - c.lh < 12) return; c.lh = now;
+    const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
+    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= 250)) return;
+    wsOut(v, { t: 'hit', from: c.pid, d, hs: m.hs ? 1 : 0 });
+  } else if (m.t === 'hit2' && r.host === c.pid) {
+    const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
+    if (!v || !(d >= 1 && d <= 60)) return;
+    wsOut(v, { t: 'hit', from: -1, d, bn: String(m.bn || 'BOT').slice(0, 30) });
+  } else if (m.t === 'bh' && r.host !== c.pid) {
+    const h = r.pl.get(r.host), d = Math.round(Number(m.d)), i = m.i | 0;
+    if (!h || i < 0 || i > 19 || !(d >= 1 && d <= 250)) return;
+    wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
+  } else if (m.t === 'kl') {
+    const kt = m.kt === 1 ? 1 : 0; r.sc[kt]++;
+    roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc });
+    if (r.sc[kt] >= 50) { roomOut(r, { t: 'end', win: kt, sc: r.sc }); r.sc = [0, 0]; r.t0 = Date.now(); }
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
     roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0] : [0, 0, 0, 0, 0, 2]) }, c);
   }
 }
+setInterval(() => { const n = Date.now(); for (const r of ROOMS.values()) if (n - r.t0 >= 603000) { r.t0 = n; r.sc = [0, 0]; } }, 5000).unref();
 function wsOpen(sock, head) {
-  const c = { sock, dead: false, room: null, ls: 0, lb: 0, seen: Date.now() }; let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0), frag = null;
+  const c = { sock, dead: false, room: null, ls: 0, lb: 0, lh: 0, seen: Date.now() }; let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0), frag = null;
   sock.setNoDelay(true); sock.setTimeout(0);
   const t0 = setTimeout(() => { if (!c.room) wsDrop(c); }, 8000);
   const eat = () => {
