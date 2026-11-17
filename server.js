@@ -100,14 +100,27 @@ const tcOf = r => { const t = [0, 0]; for (const c of r.pl.values()) t[c.tm]++; 
 const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.stringify(o))); } catch (e) { } };
 const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
 const CODES = new Map();   // private code -> room
-function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0] }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
+function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'ind', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
 function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)]; if (!CODES.has(c)) return c; } return null; }
 function findRoom(team) {
-  for (const r of ROOMS.values()) if (!r.priv && r.pl.size < MAXP && tcOf(r)[team] < MAXT) return r;
-  return newGeneral();
+  let best = null; for (const r of ROOMS.values()) if (!r.priv && r.pl.size < MAXP && tcOf(r)[team] < MAXT && (!best || r.pl.size > best.pl.size)) best = r;
+  return best || newGeneral();
 }
 const lbOf = r => [...r.pl.values()].map(o => [o.pid, o.k | 0, o.d | 0]);
+const MAPS = ['ind', 'des', 'cit'], VOTE_MS = Number(process.env.VOTE_MS) || 10000, RES_MS = Number(process.env.RES_MS) || 6000;
+const vcount = r => { const v = { ind: 0, des: 0, cit: 0 }; for (const m of r.votes.values()) if (v[m] !== undefined) v[m]++; return v; };
+function endRound(r, win) {
+  if (r.ph !== 'play') return;
+  roomOut(r, { t: 'end', win, sc: r.sc, lb: lbOf(r), rs: RES_MS, vl: RES_MS + VOTE_MS });
+  r.ph = 'vote'; r.vend = Date.now() + RES_MS + VOTE_MS; r.votes.clear();
+}
+function startRound(r) {
+  const v = vcount(r), top = Math.max(v.ind, v.des, v.cit);
+  if (top > 0) { const c = MAPS.filter(m => v[m] === top); r.map = c[Math.floor(Math.random() * c.length)]; }
+  r.ph = 'play'; r.votes.clear(); roomReset(r); r.hs = Date.now();
+  roomOut(r, { t: 'go', map: r.map });
+}
 function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; for (const o of r.pl.values()) { o.k = 0; o.d = 0; } }
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
@@ -115,8 +128,9 @@ function wsDrop(c) {
   const r = c.room; if (!r) return; r.pl.delete(c.pid);
   if (!r.pl.size) { ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
   roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
-  if (r.host === c.pid) { r.host = r.pl.keys().next().value; roomOut(r, { t: 'h', host: r.host }); }
+  if (r.host === c.pid) { r.host = r.pl.keys().next().value; r.hs = Date.now(); roomOut(r, { t: 'h', host: r.host }); }
 }
+function fixHost(r) { const h = r.pl.get(r.host); if (!h || h.vis !== 0) return; const n = [...r.pl.values()].find(o => o.vis !== 0); if (n) { r.host = n.pid; r.hs = Date.now(); roomOut(r, { t: 'h', host: n.pid }); } }
 const num = (v, lim) => { v = Number(v); return Number.isFinite(v) ? Math.max(-lim, Math.min(lim, Math.round(v * 100) / 100)) : 0; };
 const USERS = new Map();   // user id -> client (one connection per account)
 function wsMsg(c, m) {
@@ -130,18 +144,18 @@ function wsMsg(c, m) {
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
       const team = m.team === 1 ? 1 : 0;
       let r = null;
-      if (m.create) { const code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); }
-      else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4)); if (!r) return soft('No private server has that code.'); }
+      if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); }
+      else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
       else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
       else r = findRoom(team);
       if (r.pl.size >= MAXP) { if (m.create) ROOMS.delete(r.id); return soft('That server is full (12 players).'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
       c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = tcOf(r)[team] < MAXT ? team : 1 - team; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.k = 0; c.d = 0;
-      if (!r.host) r.host = pid;
+      if (!r.host) { r.host = pid; r.hs = Date.now(); }
       const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: r.priv ? 1 : 0, code: r.code, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r) });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: r.priv ? 1 : 0, code: r.code, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r) });
       roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
     }).catch(() => wsDrop(c));
     return;
@@ -156,6 +170,16 @@ function wsMsg(c, m) {
     if (cm === 'time') { r.t0 = Math.min(Date.now() - 1000, r.t0 - 60000); if (Date.now() - r.t0 > 570000) r.t0 = Date.now() - 570000; roomOut(r, { t: 'clk', el: Date.now() - r.t0 }); return; }
     if (!['freeze', 'killred', 'auto', 'follow', 'hold', 'attack', 'defend', 'spread'].includes(cm) || r.host === c.pid) return;
     const h = r.pl.get(r.host); if (h) wsOut(h, { t: 'adm', c: cm, tm: c.tm, from: c.pid });
+  } else if (m.t === 'vis') {
+    c.vis = m.v ? 1 : 0; fixHost(r);
+  } else if (m.t === 'vote') {
+    if (r.ph !== 'vote' || !MAPS.includes(m.m)) return; r.votes.set(c.pid, m.m); roomOut(r, { t: 'vt', v: vcount(r) });
+  } else if (m.t === 'nd') {
+    if (now - (c.lg || 0) < 150) return; c.lg = now;
+    roomOut(r, { t: 'nd', i: c.pid, tm: c.tm, k: m.k === 'sm' ? 'sm' : 'gr', x: num(m.x, 200), y: num(m.y, 50), z: num(m.z, 200), vx: num(m.vx, 60), vy: num(m.vy, 60), vz: num(m.vz, 60) }, c);
+  } else if (m.t === 'nx') {
+    if (now - (c.lx || 0) < 100) return; c.lx = now;
+    roomOut(r, { t: 'nx', i: c.pid, tm: c.tm, x: num(m.x, 200), z: num(m.z, 200) }, c);
   } else if (m.t === 'fx') {
     if (now - (c.lf || 0) < 40) return; c.lf = now;
     roomOut(r, { t: 'fx', i: c.pid, w: Math.max(0, Math.min(40, m.w | 0)) }, c);
@@ -177,16 +201,33 @@ function wsMsg(c, m) {
     if (!h || i < 0 || i > 19 || !(d >= 1 && d <= 250)) return;
     wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'kl') {
+    if (r.ph !== 'play') return;
     const kt = m.kt === 1 ? 1 : 0; r.sc[kt]++;
     const kc = r.pl.get(m.kp | 0); if (kc && kc.tm === kt) kc.k++; if (m.vp) c.d++;
     roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc, lb: lbOf(r) });
-    if (r.sc[kt] >= 50) { const fin = lbOf(r); roomOut(r, { t: 'end', win: kt, sc: r.sc, lb: fin }); roomReset(r); }
+    if (r.sc[kt] >= 50) endRound(r, kt);
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
     roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0))] : [0, 0, 0, 0, 0, 2, 0]) }, c);
   }
 }
-setInterval(() => { const n = Date.now(); for (const r of ROOMS.values()) if (n - r.t0 >= 603000) roomReset(r); }, 5000).unref();
+setInterval(() => {
+  const n = Date.now();
+  for (const r of ROOMS.values()) {
+    if (r.ph === 'play' && n - r.t0 >= 603000) endRound(r, r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1);
+    else if (r.ph === 'vote' && n >= r.vend) startRound(r);
+  }
+}, 500).unref();
+/* if the host stops sending bots (hidden window, frozen tab) hand the bots to a player who is still actively playing */
+setInterval(() => {
+  const n = Date.now();
+  for (const r of ROOMS.values()) {
+    if (r.pl.size < 2 || r.ph !== 'play') continue; const h = r.pl.get(r.host); if (!h) continue;
+    if (n - Math.max(h.lb || 0, r.hs || 0) < 5000) continue;
+    const cand = [...r.pl.values()].find(o => o !== h && n - (o.ls || 0) < 1500);
+    if (cand) { r.host = cand.pid; r.hs = n; roomOut(r, { t: 'h', host: cand.pid }); }
+  }
+}, 2000).unref();
 function wsOpen(sock, head) {
   const c = { sock, dead: false, room: null, ls: 0, lb: 0, lh: 0, seen: Date.now() }; let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0), frag = null;
   sock.setNoDelay(true); sock.setTimeout(0);
@@ -220,7 +261,7 @@ const server = http.createServer(async (req, res) => {
     const url = req.url.split('?')[0], ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file', rooms: ROOMS.size, online: USERS.size });
     if (url === '/api/rooms' && req.method === 'GET') {
-      const now = Date.now(), list = [...ROOMS.values()].filter(r => !r.priv).map(r => ({ id: r.id, name: r.name, n: r.pl.size, tc: tcOf(r), el: now - r.t0, sc: r.sc }));
+      const now = Date.now(), list = [...ROOMS.values()].filter(r => !r.priv).map(r => ({ id: r.id, name: r.name, n: r.pl.size, tc: tcOf(r), el: now - r.t0, sc: r.sc, ph: r.ph, map: r.map }));
       if (!list.some(r => r.n < MAXP)) list.push({ id: '', name: 'NEW GENERAL SERVER', n: 0, tc: [0, 0], el: 0, sc: [0, 0] });
       return send(res, 200, { rooms: list, max: MAXP, maxTeam: MAXT });
     }

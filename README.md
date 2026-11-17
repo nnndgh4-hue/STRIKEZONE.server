@@ -57,3 +57,9 @@ The server now also passes hits between players, counts team kills per room, and
 
 ## Server list, private servers, chat
 `GET /api/rooms` lists public servers. A join message may include `room` (id), `code` (private code) or `create:1` (new private server). Chat is `{t:'c',m}` and stays inside one server. Admin accounts may be connected from two windows.
+
+## Map voting and rounds
+A room starts in a 10 second vote phase (`VOTE_MS`), then plays a round (50 kills or 10 minutes), shows results for 6 seconds (`RES_MS`), then votes again. Messages: `vote`, `vt`, `go`, `end` (with `rs` and `vl`). Thrown grenades use `nd` and `nx`.
+
+## Private servers with your own code
+"CREATE PRIVATE SERVER" lets the creator type a code (3-10 letters/numbers). Codes are unique; others join with JOIN WITH CODE and the exact code. Private servers never show in the list.
