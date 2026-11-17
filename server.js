@@ -217,7 +217,7 @@ function wsMsg(c, m) {
     if (r.co) { if (r.ph !== 'play') return; c.pa = false; coCheck(r); return; }
     if (!r.pvp || r.ph !== 'play') return; c.pa = false; pvpCheck(r);
   } else if (m.t === 'wv') {
-    if (!r.co || r.host !== c.pid) return; const w = Math.max(0, Math.min(999, m.w | 0)); r.cw = w;
+    if (!r.co || r.host !== c.pid) return; const w = Math.max(0, Math.min(999, m.w | 0)); r.cw = w; if (m.p === 's') for (const o of r.pl.values()) o.pa = true;
     roomOut(r, { t: 'wv', w, l: Math.max(0, Math.min(999, m.l | 0)), a: Math.max(0, Math.min(20, m.a | 0)), p: m.p === 's' ? 's' : 'h' }, c);
   } else if (m.t === 'vis') {
     c.vis = m.v ? 1 : 0; fixHost(r);
