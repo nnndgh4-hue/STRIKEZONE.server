@@ -63,3 +63,6 @@ A room starts in a 10 second vote phase (`VOTE_MS`), then plays a round (50 kill
 
 ## Private servers with your own code
 "CREATE PRIVATE SERVER" lets the creator type a code (3-10 letters/numbers). Codes are unique; others join with JOIN WITH CODE and the exact code. Private servers never show in the list.
+
+## PvP queues
+Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue is full the room goes to a map vote, then plays best of up to 9 rounds: no bots, one life per round, first team to 3 round wins. Round time 120 s (env PVP_RT), break between rounds 4 s (env PVP_BREAK). PvP rooms never appear in the server list.
