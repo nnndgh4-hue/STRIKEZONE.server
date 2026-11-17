@@ -1,1 +1,53 @@
-# STRIKEZONE.server
+# STRIKEZONE account server
+
+This small server lets players create accounts and keep their game progress on every device.
+The game page (index.html) stays on GitHub Pages. This server runs separately on Render.
+
+## What you need (all free)
+- A GitHub account (you already have one)
+- A Render account: https://render.com
+- A free Postgres database. Neon (https://neon.tech) is easy. Render's own free Postgres also works, but it expires after 30 days.
+
+Why a database? Render's free web service forgets any files whenever it restarts, so accounts must live in Postgres.
+
+## Step 1: Create the database (Neon)
+1. Sign up at neon.tech and create a project (any name, any region near you).
+2. On the project page, copy the **connection string** (it starts with `postgresql://`). Keep it private. It is the database password.
+
+## Step 2: Put the server on GitHub
+1. Make a new GitHub repository called `strikezone-server`.
+2. Upload the two files from this folder: `server.js` and `package.json`. (Do not upload your connection string anywhere.)
+
+## Step 3: Deploy on Render
+1. In Render choose **New + > Web Service** and pick your `strikezone-server` repository.
+2. Settings: Runtime **Node**, Build command `npm install`, Start command `npm start`, Instance type **Free**.
+3. Under **Environment**, add one variable: `DATABASE_URL` = the connection string from Step 1.
+4. Click **Create Web Service**. When it says "Live", open the address Render gives you (like `https://strikezone-server.onrender.com`). You should see `{"ok":true,"game":"strikezone","storage":"postgres"}`. If it says `"storage":"file"` the DATABASE_URL was not set.
+
+## Step 4: Connect the game
+1. Open the game and press **LOG IN / CREATE ACCOUNT**.
+2. Paste your Render address into **Server address**, enter a username and password, and press **CREATE ACCOUNT**.
+3. On another device, open the game, enter the same server address, and press **LOG IN**.
+
+The game remembers the server address on each device. To skip typing it, open index.html in a text editor, find `var DEFAULT_API='';` and put your address between the quotes.
+
+## Good to know
+- Render's free service goes to sleep when nobody uses it. The first login after a quiet period can take up to a minute. The game tells you it is waking the server.
+- Passwords are stored as salted scrypt hashes, never as plain text. Sessions last 90 days.
+- Usernames are 3 to 20 letters, numbers or underscores. Passwords need 8 or more characters. There is no password reset yet, so keep it safe.
+- Anti-cheat: the server checks every save. It rejects impossible values, and it limits how fast coins and XP can grow since the last save (a generous allowance plus a rate per second). A save that grows too fast is rejected and the player's last valid progress is restored. A first upload is limited to about Prestige 1 of XP and 100,000 coins.
+- This stops casual editing, not a determined cheater who earns slowly, and it does not check which items were bought. Fully stopping cheating needs the server to run the matches, which would be part of real online multiplayer.
+
+## Testing on your own computer (optional)
+`node server.js` starts it on port 3000 using a local file instead of Postgres. Do not use that mode for a public server.
+
+## Admin account (optional)
+The server marks the username `alphang7` (any capitals) as the admin. To use different names, add an environment variable `ADMIN_USERS` in Render (comma separated, for example `name1,name2`) and redeploy. The admin password is never stored in the code. Create the admin account yourself as soon as the server is updated, so nobody else can take the name.
+
+
+## Live events (admin broadcasts)
+The server also keeps a short in-memory list of live events. The admin account (`AlphaNG7`, or whoever is in the `ADMINS` variable) can send them from the in-game command center (`POST /api/event`). Every open game polls `GET /api/events` every few seconds and plays any new event. Events are kept for 2 minutes and then forgotten, so nothing is stored in the database. After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest commit).
+
+## Live play (WebSocket)
+`server.js` now also runs the live game rooms (no extra packages needed). Players connect to `/ws` with their login. Each room holds up to 12 players, at most 10 per team; when a room is full another one opens. One player's game runs the bots for the room, and the server passes positions between everyone. Rooms live in memory only.
+To update: upload the new `server.js` to GitHub, then on Render use Manual Deploy > Deploy latest commit. Check `/api/health`, it now shows `rooms` and `online`.
