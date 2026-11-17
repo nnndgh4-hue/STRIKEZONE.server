@@ -69,3 +69,7 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 
 ## Co-op waves
 "ONLINE CO-OP" (from PLAY when the mode is Wave Survival) joins a co-op room: up to 6 players, all on one team, host's game runs the enemies, one life each. If every player is down the room restarts from wave 1 after 5 s. Co-op rooms are not in the server list; private co-op rooms use a code like any private server.
+
+## Leaderboards and titles
+- GET /api/leaderboard: global top 100 (total points) and today's top 10 (points earned today, resets at midnight Adelaide time; set LB_TZ to change). Send the login token to also get your own rank. Players appear after their first cloud save.
+- Admin only: POST /api/title {user, text, color} sets a title (up to 16 characters, colour like #ffd400); empty text removes it. GET /api/titles lists them. New tables (lb, titles) are created automatically.

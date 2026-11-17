@@ -16,6 +16,10 @@ if (process.env.DATABASE_URL) {
       await pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY, name TEXT NOT NULL, lname TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL, created BIGINT NOT NULL)`);
       await pool.query(`CREATE TABLE IF NOT EXISTS saves(uid INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL, upd BIGINT NOT NULL)`);
       await pool.query('ALTER TABLE saves ADD COLUMN IF NOT EXISTS at BIGINT');
+      await pool.query(`CREATE TABLE IF NOT EXISTS lb(uid INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, pts BIGINT NOT NULL DEFAULT 0, day TEXT NOT NULL DEFAULT '', dpts BIGINT NOT NULL DEFAULT 0)`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS titles(lname TEXT PRIMARY KEY, name TEXT NOT NULL, txt TEXT NOT NULL, col TEXT NOT NULL)`);
+      const miss = await pool.query('SELECT u.id,u.name,s.data FROM saves s JOIN users u ON u.id=s.uid WHERE u.id NOT IN (SELECT uid FROM lb)');
+      for (const r of miss.rows) { let p = 0; try { p = Math.max(0, Math.round(JSON.parse(r.data).pts || 0)); } catch (e) { } await pool.query('INSERT INTO lb(uid,name,pts) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [r.id, r.name, p]); }
       await pool.query(`CREATE TABLE IF NOT EXISTS sessions(th TEXT PRIMARY KEY, uid INT NOT NULL REFERENCES users(id) ON DELETE CASCADE, exp BIGINT NOT NULL)`);
     },
     async userByName(l) { const r = await pool.query('SELECT * FROM users WHERE lname=$1', [l]); return r.rows[0] || null; },
@@ -24,11 +28,21 @@ if (process.env.DATABASE_URL) {
     async sessionUser(th) { const r = await pool.query('SELECT u.id,u.name FROM sessions s JOIN users u ON u.id=s.uid WHERE s.th=$1 AND s.exp>$2', [th, Date.now()]); return r.rows[0] || null; },
     async delSession(th) { await pool.query('DELETE FROM sessions WHERE th=$1', [th]); },
     async getSave(uid) { const r = await pool.query('SELECT data,upd,at FROM saves WHERE uid=$1', [uid]); return r.rows[0] ? { data: r.rows[0].data, upd: Number(r.rows[0].upd), at: Number(r.rows[0].at || r.rows[0].upd) } : null; },
-    async putSave(uid, data, upd, at) { await pool.query('INSERT INTO saves(uid,data,upd,at) VALUES($1,$2,$3,$4) ON CONFLICT(uid) DO UPDATE SET data=$2,upd=$3,at=$4', [uid, data, upd, at]); }
+    async putSave(uid, data, upd, at) { await pool.query('INSERT INTO saves(uid,data,upd,at) VALUES($1,$2,$3,$4) ON CONFLICT(uid) DO UPDATE SET data=$2,upd=$3,at=$4', [uid, data, upd, at]); },
+    async lbSet(uid, name, pts, delta, day) {
+      await pool.query(`INSERT INTO lb(uid,name,pts,day,dpts) VALUES($1,$2,$3,$4,$5) ON CONFLICT(uid) DO UPDATE SET name=$2, pts=$3, dpts=(CASE WHEN lb.day=$4 THEN lb.dpts ELSE 0 END)+$5, day=$4`, [uid, name, pts, day, delta]);
+    },
+    async lbTop(n) { const r = await pool.query('SELECT uid,name,pts FROM lb ORDER BY pts DESC, uid ASC LIMIT $1', [n]); return r.rows.map(x => ({ uid: x.uid, n: x.name, p: Number(x.pts) })); },
+    async lbDay(day, n) { const r = await pool.query('SELECT uid,name,dpts FROM lb WHERE day=$1 AND dpts>0 ORDER BY dpts DESC, uid ASC LIMIT $2', [day, n]); return r.rows.map(x => ({ uid: x.uid, n: x.name, p: Number(x.dpts) })); },
+    async lbMe(uid, day) { const r = await pool.query('SELECT pts,day,dpts FROM lb WHERE uid=$1', [uid]); const m = r.rows[0]; if (!m) return null; const a = await pool.query('SELECT COUNT(*) c FROM lb WHERE pts>$1', [m.pts]); const dp = m.day === day ? Number(m.dpts) : 0; let dr = 0; if (dp > 0) { const b = await pool.query('SELECT COUNT(*) c FROM lb WHERE day=$1 AND dpts>$2', [day, dp]); dr = Number(b.rows[0].c) + 1; } return { rank: Number(a.rows[0].c) + 1, pts: Number(m.pts), drank: dr, dpts: dp }; },
+    async titlesAll() { const r = await pool.query('SELECT lname,name,txt,col FROM titles'); return r.rows; },
+    async titleSet(lname, name, txt, col) { await pool.query('INSERT INTO titles(lname,name,txt,col) VALUES($1,$2,$3,$4) ON CONFLICT(lname) DO UPDATE SET name=$2,txt=$3,col=$4', [lname, name, txt, col]); },
+    async titleDel(lname) { await pool.query('DELETE FROM titles WHERE lname=$1', [lname]); }
   };
 } else {
   let db = { n: 1, users: {}, saves: {}, sessions: {} };
   try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
+  db.lb = db.lb || {}; db.titles = db.titles || {};
   let t = null; const flush = () => { clearTimeout(t); t = setTimeout(() => { try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch (e) { console.error('save failed', e.message); } }, 300); };
   store = {
     async init() {},
@@ -38,8 +52,16 @@ if (process.env.DATABASE_URL) {
     async sessionUser(th) { const s = db.sessions[th]; if (!s || s.exp < Date.now()) return null; const u = Object.values(db.users).find(x => x.id === s.uid); return u ? { id: u.id, name: u.name } : null; },
     async delSession(th) { delete db.sessions[th]; flush(); },
     async getSave(uid) { return db.saves[uid] || null; },
-    async putSave(uid, data, upd, at) { db.saves[uid] = { data, upd, at }; flush(); }
+    async putSave(uid, data, upd, at) { db.saves[uid] = { data, upd, at }; flush(); },
+    async lbSet(uid, name, pts, delta, day) { const o = db.lb[uid] || { day: '', dpts: 0 }; db.lb[uid] = { name, pts, day, dpts: (o.day === day ? o.dpts : 0) + delta }; flush(); },
+    async lbTop(n) { return Object.entries(db.lb).map(([u, x]) => ({ uid: Number(u), n: x.name, p: x.pts })).sort((a, b) => b.p - a.p || a.uid - b.uid).slice(0, n); },
+    async lbDay(day, n) { return Object.entries(db.lb).filter(([, x]) => x.day === day && x.dpts > 0).map(([u, x]) => ({ uid: Number(u), n: x.name, p: x.dpts })).sort((a, b) => b.p - a.p || a.uid - b.uid).slice(0, n); },
+    async lbMe(uid, day) { const m = db.lb[uid]; if (!m) return null; const all = Object.values(db.lb); const dp = m.day === day ? m.dpts : 0; return { rank: all.filter(x => x.pts > m.pts).length + 1, pts: m.pts, drank: dp > 0 ? all.filter(x => x.day === day && x.dpts > dp).length + 1 : 0, dpts: dp }; },
+    async titlesAll() { return Object.entries(db.titles).map(([l, x]) => ({ lname: l, name: x.name, txt: x.txt, col: x.col })); },
+    async titleSet(lname, name, txt, col) { db.titles[lname] = { name, txt, col }; flush(); },
+    async titleDel(lname) { delete db.titles[lname]; flush(); }
   };
+  for (const [l, u] of Object.entries(db.users)) { const sv = db.saves[u.id]; if (sv && !db.lb[u.id]) { let p = 0; try { p = Math.max(0, Math.round(JSON.parse(sv.data).pts || 0)); } catch (e) { } db.lb[u.id] = { name: u.name, pts: p, day: '', dpts: 0 }; } }
 }
 
 /* ---------- helpers ---------- */
@@ -82,6 +104,12 @@ function cleanSave(o) {
 /* Admin accounts (set ADMIN_USERS on Render to change; comma separated, case does not matter). The admin password is never stored here. */
 const ADMINS = (process.env.ADMIN_USERS || 'alphang7').toLowerCase().split(',').map(x => x.trim()).filter(Boolean);
 const isAdmin = n => ADMINS.includes(String(n || '').toLowerCase());
+/* "today" for the daily leaderboard follows Adelaide time (set LB_TZ on Render to change) */
+const LB_TZ = process.env.LB_TZ || 'Australia/Adelaide';
+const dayKey = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: LB_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch (e) { return new Date().toISOString().slice(0, 10); } };
+const TITLES = new Map();   // lowercase username -> { n, t, c }
+const HEX = /^#[0-9a-fA-F]{6}$/;
+let lbCache = null, lbCacheAt = 0;
 
 function plausible(save, prev, now) {
   const xp = totalXP(save.lvl || 1, save.xp || 0), coins = save.coins;
@@ -358,6 +386,25 @@ const server = http.createServer(async (req, res) => {
       const list = EVS.filter(e => (since >= 0 ? e.seq > since : now - e.ts < 15000) && now - e.ts < 60000).map(e => ({ seq: e.seq, id: e.id, type: e.type, data: e.data, age: now - e.ts }));
       return send(res, 200, { seq: evSeq, events: list });
     }
+    if (url === '/api/leaderboard' && req.method === 'GET') {
+      const day = dayKey(), nowt = Date.now();
+      if (!lbCache || lbCache.day !== day || nowt - lbCacheAt > 20000) { lbCache = { day, g: await store.lbTop(100), d: await store.lbDay(day, 10) }; lbCacheAt = nowt; }
+      const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p })), d: lbCache.d.map(x => ({ n: x.n, p: x.p })), me: null };
+      const u = await auth(req); if (u) out.me = await store.lbMe(u.id, day);
+      return send(res, 200, out);
+    }
+    if (url === '/api/titles' && req.method === 'GET') { const t = {}; for (const [k, v] of TITLES) t[k] = [v.t, v.c]; return send(res, 200, { titles: t }); }
+    if (url === '/api/title' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), un = String(b.user || '').trim();
+      if (!NAME.test(un)) return send(res, 400, { error: 'Type the exact username of the player.' });
+      const target = await store.userByName(un.toLowerCase()); if (!target) return send(res, 404, { error: 'No player has that username.' });
+      const txt = String(b.text || '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 16);
+      if (!txt) { await store.titleDel(un.toLowerCase()); TITLES.delete(un.toLowerCase()); return send(res, 200, { ok: true, removed: true }); }
+      const col = HEX.test(String(b.color || '')) ? String(b.color).toLowerCase() : '#ffd400';
+      await store.titleSet(un.toLowerCase(), target.name, txt, col); TITLES.set(un.toLowerCase(), { n: target.name, t: txt, c: col });
+      return send(res, 200, { ok: true, user: target.name, text: txt, color: col });
+    }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
       if (req.method === 'GET') { const s = await store.getSave(u.id); return send(res, 200, { user: u.name, admin: isAdmin(u.name), save: s ? JSON.parse(s.data) : null, upd: s ? s.upd : 0 }); }
@@ -365,7 +412,9 @@ const server = http.createServer(async (req, res) => {
         const b = await body(req), save = cleanSave(b.save); if (!save) return send(res, 400, { error: 'Invalid save.' });
         const now = Date.now(), prev = await store.getSave(u.id), upd = Math.min(Number(b.upd) || now, now + 60000);
         if (!isAdmin(u.name) && !plausible(save, prev, now)) return send(res, 422, { error: 'That save has progress that is not possible, so your last valid progress was restored.', save: prev ? JSON.parse(prev.data) : null, upd: prev ? prev.upd : 0 });
-        await store.putSave(u.id, JSON.stringify(save), upd, now); return send(res, 200, { ok: true, upd });
+        await store.putSave(u.id, JSON.stringify(save), upd, now);
+        try { const np = Math.max(0, Math.round(save.pts || 0)), op = prev ? Math.max(0, Math.round(JSON.parse(prev.data).pts || 0)) : np; await store.lbSet(u.id, u.name, np, Math.max(0, Math.min(np - op, 200000)), dayKey()); lbCache = null; } catch (e) { console.error('lb', e.message); }
+        return send(res, 200, { ok: true, upd });
       }
     }
     send(res, 404, { error: 'Not found' });
@@ -383,5 +432,5 @@ server.on('upgrade', (req, sock, head) => {
     wsOpen(sock, head);
   } catch (e) { try { sock.destroy(); } catch (x) { } }
 });
-store.init().then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
+store.init().then(async () => { for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
   .catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
