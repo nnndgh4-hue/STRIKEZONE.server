@@ -120,6 +120,7 @@ function startRound(r) {
   if (top > 0) { const c = MAPS.filter(m => v[m] === top); r.map = c[Math.floor(Math.random() * c.length)]; }
   r.ph = 'play'; r.votes.clear(); roomReset(r); r.hs = Date.now();
   if (r.pvp) r.rn++;
+  if (r.co) r.cw = 0;
   roomOut(r, { t: 'go', map: r.map, rn: r.rn | 0, rw: r.rw || [0, 0] });
 }
 function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; for (const o of r.pl.values()) { if (!r.pvp) { o.k = 0; o.d = 0; } o.pa = true; } }
@@ -149,6 +150,14 @@ function pvpCheck(r) {
   const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1);
   if (!a0 && !a1) pvpEnd(r, -1); else if (!a0) pvpEnd(r, 1); else if (!a1) pvpEnd(r, 0);
 }
+/* ---------- CO-OP waves: up to 6 players, all on one team, one life each, everybody down = restart from wave 1 ---------- */
+const COMAX = 6; let coN = 0;
+function coRoom() {
+  for (const r of ROOMS.values()) if (r.co && !r.code && r.pl.size < COMAX && r.ph !== 'done') return r;
+  const r = newRoom('co-' + (++coN), 'CO-OP WAVES ' + coN, ''); r.co = 1; r.priv = true; r.cw = 0; return r;
+}
+function coWipe(r) { if (!r.co || r.ph !== 'play') return; r.ph = 'break'; r.vend = Date.now() + 5000; roomOut(r, { t: 'cx', w: r.cw | 0 }); }
+function coCheck(r) { if (!r.co || r.ph !== 'play' || !r.pl.size) return; for (const o of r.pl.values()) if (o.pa) return; coWipe(r); }
 function pvpQ(r) { roomOut(r, { t: 'pq', have: r.pl.size, need: 2 * r.pvp, names: [...r.pl.values()].map(o => o.name) }); }
 function pvpFull(r) { r.ph = 'vote'; r.vend = Date.now() + VOTE_MS; r.votes.clear(); r.rw = [0, 0]; r.rn = 0; roomOut(r, { t: 'pv', vl: VOTE_MS, need: 2 * r.pvp }); }
 function wsDrop(c) {
@@ -158,6 +167,7 @@ function wsDrop(c) {
   if (!r.pl.size) { ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
   roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
   if (r.pvp) { if (r.ph === 'wait') pvpQ(r); else pvpCheck(r); }
+  if (r.co) coCheck(r);
   if (r.host === c.pid) { r.host = r.pl.keys().next().value; r.hs = Date.now(); roomOut(r, { t: 'h', host: r.host }); }
 }
 function fixHost(r) { const h = r.pl.get(r.host); if (!h || h.vis !== 0) return; const n = [...r.pl.values()].find(o => o.vis !== 0); if (n) { r.host = n.pid; r.hs = Date.now(); roomOut(r, { t: 'h', host: n.pid }); } }
@@ -174,19 +184,20 @@ function wsMsg(c, m) {
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
       const team = m.team === 1 ? 1 : 0;
       let r = null;
-      if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); }
+      if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
       else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
+      else if (m.co) r = coRoom();
       else if (m.pvp) { const pn = m.pvp | 0; if (![1, 2, 3].includes(pn)) return soft('Pick 1v1, 2v2 or 3v3.'); r = pvpRoom(pn); }
       else r = findRoom(team);
-      if (r.pl.size >= MAXP) { if (m.create) ROOMS.delete(r.id); return soft('That server is full (12 players).'); }
+      if (r.pl.size >= (r.co ? COMAX : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.k = 0; c.d = 0;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.k = 0; c.d = 0;
       if (!r.host) { r.host = pid; r.hs = Date.now(); }
       const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: r.priv ? 1 : 0, code: r.code, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0 });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0 });
       roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
       if (r.pvp && r.ph === 'wait') { pvpQ(r); if (r.pl.size >= 2 * r.pvp) pvpFull(r); }
     }).catch(() => wsDrop(c));
@@ -203,7 +214,11 @@ function wsMsg(c, m) {
     if (!['freeze', 'killred', 'auto', 'follow', 'hold', 'attack', 'defend', 'spread'].includes(cm) || r.host === c.pid) return;
     const h = r.pl.get(r.host); if (h) wsOut(h, { t: 'adm', c: cm, tm: c.tm, from: c.pid });
   } else if (m.t === 'pd') {
+    if (r.co) { if (r.ph !== 'play') return; c.pa = false; coCheck(r); return; }
     if (!r.pvp || r.ph !== 'play') return; c.pa = false; pvpCheck(r);
+  } else if (m.t === 'wv') {
+    if (!r.co || r.host !== c.pid) return; const w = Math.max(0, Math.min(999, m.w | 0)); r.cw = w;
+    roomOut(r, { t: 'wv', w, l: Math.max(0, Math.min(999, m.l | 0)), a: Math.max(0, Math.min(20, m.a | 0)), p: m.p === 's' ? 's' : 'h' }, c);
   } else if (m.t === 'vis') {
     c.vis = m.v ? 1 : 0; fixHost(r);
   } else if (m.t === 'vote') {
@@ -239,18 +254,20 @@ function wsMsg(c, m) {
     wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'kl') {
     if (r.ph !== 'play') return;
-    const kt = m.kt === 1 ? 1 : 0; r.sc[kt]++;
+    const kt = m.kt === 1 ? 1 : 0; if (r.co) { const q = r.pl.get(m.kp | 0); if (q && kt === 0) q.k++; if (m.vp) c.d++; roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: [0, 0], lb: lbOf(r) }); return; }
+    r.sc[kt]++;
     const kc = r.pl.get(m.kp | 0); if (kc && kc.tm === kt) kc.k++; if (m.vp) c.d++;
     roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc, lb: lbOf(r) });
     if (!r.pvp && r.sc[kt] >= 50) endRound(r, kt);
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
-    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0))] : [0, 0, 0, 0, 0, 2, 0]) }, c);
+    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0))] : [0, 0, 0, 0, 0, 2, 0, 0]) }, c);
   }
 }
 setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
+    if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
       if (r.ph === 'play' && n - r.t0 >= PVP_RT) { const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1); pvpEnd(r, a0 > a1 ? 0 : a1 > a0 ? 1 : r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1); }
       else if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) { startRound(r); pvpCheck(r); }

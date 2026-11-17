@@ -66,3 +66,6 @@ A room starts in a 10 second vote phase (`VOTE_MS`), then plays a round (50 kill
 
 ## PvP queues
 Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue is full the room goes to a map vote, then plays best of up to 9 rounds: no bots, one life per round, first team to 3 round wins. Round time 120 s (env PVP_RT), break between rounds 4 s (env PVP_BREAK). PvP rooms never appear in the server list.
+
+## Co-op waves
+"ONLINE CO-OP" (from PLAY when the mode is Wave Survival) joins a co-op room: up to 6 players, all on one team, host's game runs the enemies, one life each. If every player is down the room restarts from wave 1 after 5 s. Co-op rooms are not in the server list; private co-op rooms use a code like any private server.
