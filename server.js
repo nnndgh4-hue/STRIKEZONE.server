@@ -136,16 +136,16 @@ function findRoom(team) {
   return best || newGeneral();
 }
 const lbOf = r => [...r.pl.values()].map(o => [o.pid, o.k | 0, o.d | 0]);
-const MAPS = ['ind', 'des', 'cit'], VOTE_MS = Number(process.env.VOTE_MS) || 10000, RES_MS = Number(process.env.RES_MS) || 6000;
-const vcount = r => { const v = { ind: 0, des: 0, cit: 0 }; for (const m of r.votes.values()) if (v[m] !== undefined) v[m]++; return v; };
+const MAPS = ['ind', 'des', 'cit'], PVMAPS = ['pv1', 'pv2', 'pv3'], mapsOf = r => (r.pvp ? PVMAPS : MAPS), VOTE_MS = Number(process.env.VOTE_MS) || 10000, RES_MS = Number(process.env.RES_MS) || 6000;
+const vcount = r => { const v = {}; mapsOf(r).forEach(k => { v[k] = 0; }); for (const m of r.votes.values()) if (v[m] !== undefined) v[m]++; return v; };
 function endRound(r, win) {
   if (r.ph !== 'play') return;
   roomOut(r, { t: 'end', win, sc: r.sc, lb: lbOf(r), rs: RES_MS, vl: RES_MS + VOTE_MS });
   r.ph = 'vote'; r.vend = Date.now() + RES_MS + VOTE_MS; r.votes.clear();
 }
 function startRound(r) {
-  const v = vcount(r), top = Math.max(v.ind, v.des, v.cit);
-  if (top > 0) { const c = MAPS.filter(m => v[m] === top); r.map = c[Math.floor(Math.random() * c.length)]; }
+  const v = vcount(r), ml = mapsOf(r), top = Math.max(...ml.map(k => v[k]));
+  if (top > 0) { const c = ml.filter(m => v[m] === top); r.map = c[Math.floor(Math.random() * c.length)]; }
   r.ph = 'play'; r.votes.clear(); roomReset(r); r.hs = Date.now();
   if (r.pvp) r.rn++;
   if (r.co) r.cw = 0;
@@ -157,7 +157,7 @@ const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.
 let pvpN = 0;
 function pvpRoom(n) {
   for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait' && r.pl.size < 2 * n) return r;
-  const r = newRoom('pvp-' + (++pvpN), 'PVP ' + n + 'V' + n, ''); r.pvp = n; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; return r;
+  const r = newRoom('pvp-' + (++pvpN), 'PVP ' + n + 'V' + n, ''); r.pvp = n; r.map = 'pv1'; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; return r;
 }
 const pvpAlive = (r, t) => { let n = 0; for (const o of r.pl.values()) if (o.tm === t && o.pa) n++; return n; };
 function pvpEnd(r, win, force) {
@@ -250,7 +250,7 @@ function wsMsg(c, m) {
   } else if (m.t === 'vis') {
     c.vis = m.v ? 1 : 0; fixHost(r);
   } else if (m.t === 'vote') {
-    if (r.ph !== 'vote' || !MAPS.includes(m.m)) return; r.votes.set(c.pid, m.m); roomOut(r, { t: 'vt', v: vcount(r) });
+    if (r.ph !== 'vote' || !mapsOf(r).includes(m.m)) return; r.votes.set(c.pid, m.m); roomOut(r, { t: 'vt', v: vcount(r) });
   } else if (m.t === 'nd') {
     if (now - (c.lg || 0) < 150) return; c.lg = now;
     roomOut(r, { t: 'nd', i: c.pid, tm: c.tm, k: m.k === 'sm' ? 'sm' : 'gr', x: num(m.x, 200), y: num(m.y, 50), z: num(m.z, 200), vx: num(m.vx, 60), vy: num(m.vy, 60), vz: num(m.vz, 60) }, c);
@@ -260,6 +260,13 @@ function wsMsg(c, m) {
   } else if (m.t === 'ev') {
     if (now - (c.le0 || 0) > 1000) { c.le0 = now; c.len = 0; } if (++c.len > 60) return;
     roomOut(r, { t: 'ev', i: c.pid, k: m.k === 'b' ? 'b' : 'w', x: num(m.x, 200), y: num(m.y, 50), z: num(m.z, 200), a: m.a ? 1 : 0, px: num(m.px, 200), py: num(m.py, 50), pz: num(m.pz, 200), nx: num(m.nx, 2), ny: num(m.ny, 2), nz: num(m.nz, 2) }, c);
+  } else if (m.t === 'dr') {
+    if (now - (c.ld0 || 0) > 1000) { c.ld0 = now; c.ldn = 0; } if (++c.ldn > 80) return;
+    const id = String(m.id || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 20); if (!id) return;
+    roomOut(r, { t: 'dr', i: c.pid, id, k: m.k === 'c' ? 'c' : 'g', v: Math.max(0, Math.min(60, m.v | 0)), x: num(m.x, 200), z: num(m.z, 200), y: num(m.y, 50) }, c);
+  } else if (m.t === 'dp') {
+    const id = String(m.id || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 20); if (!id) return;
+    roomOut(r, { t: 'dp', i: c.pid, id }, c);
   } else if (m.t === 'fx') {
     if (now - (c.lf || 0) < 40) return; c.lf = now;
     roomOut(r, { t: 'fx', i: c.pid, w: Math.max(0, Math.min(40, m.w | 0)) }, c);
@@ -270,7 +277,7 @@ function wsMsg(c, m) {
   } else if (m.t === 'hit') {
     if (now - c.lh < 12) return; c.lh = now; if (r.pvp && r.ph !== 'play') return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
-    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= 250)) return;
+    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 250))) return;
     wsOut(v, { t: 'hit', from: c.pid, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'hit2' && r.host === c.pid) {
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
@@ -289,7 +296,7 @@ function wsMsg(c, m) {
     if (!r.pvp && r.sc[kt] >= 50) endRound(r, kt);
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
-    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0))] : [0, 0, 0, 0, 0, 2, 0, 0]) }, c);
+    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0)), num(a[8], 30)] : [0, 0, 0, 0, 0, 2, 0, 0, 0]) }, c);
   }
 }
 setInterval(() => {

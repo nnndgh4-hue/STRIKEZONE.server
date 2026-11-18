@@ -73,3 +73,11 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 ## Leaderboards and titles
 - GET /api/leaderboard: global top 100 (total points) and today's top 10 (points earned today, resets at midnight Adelaide time; set LB_TZ to change). Send the login token to also get your own rank. Players appear after their first cloud save.
 - Admin only: POST /api/title {user, text, color} sets a title (up to 16 characters, colour like #ffd400); empty text removes it. GET /api/titles lists them. New tables (lb, titles) are created automatically.
+
+
+## Update 25 notes
+- PvP rooms now vote between three PvP maps (`pv1`, `pv2`, `pv3`); normal rooms keep `ind`, `des`, `cit`.
+- In PvP the `hit` damage limit is 500 (instant kills from a sniper headshot or a knife backstab); everywhere else it stays 250.
+- New relay messages: `dr` (a dropped coin or gun appears for everyone) and `dp` (it was picked up). Rate limited.
+- The bot snapshot rows now carry a ninth value, the bot's height, so players see bots on towers and upper floors.
+- Upload `server.js` and `README.md` to GitHub, then press Manual Deploy on Render.
