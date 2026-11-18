@@ -81,3 +81,9 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 - New relay messages: `dr` (a dropped coin or gun appears for everyone) and `dp` (it was picked up). Rate limited.
 - The bot snapshot rows now carry a ninth value, the bot's height, so players see bots on towers and upper floors.
 - Upload `server.js` and `README.md` to GitHub, then press Manual Deploy on Render.
+
+## Update 4 notes
+- The six maps are `arena`, `dock`, `metro`, `neon`, `frost` and `outpost`. Normal rooms and PvP rooms vote between the same six; PvP rooms load the small version in the game and everything else loads the large one.
+- Old map names (`ind`, `des`, `cit`, `pv1`, `pv2`, `pv3`) are no longer accepted for votes or room settings.
+- Upload `server.js` and `README.md` to GitHub, then press Manual Deploy on Render.
+- There is no maximum level (the server accepts levels up to 100000). Prestige still tops out at 10, reached at level 1000.

@@ -91,7 +91,7 @@ function cleanSave(o) {
   for (const k of ['coins', 'xp', 'pts', 'lvl']) if (typeof c[k] === 'number' && isFinite(c[k])) c[k] = Math.round(c[k]);
   if (c.st) for (const k of Object.keys(c.st)) if (typeof c.st[k] === 'number' && isFinite(c.st[k])) c.st[k] = Math.round(c.st[k]);
   if (!isInt(c.coins, 0, 5e7)) return null;
-  if (c.lvl !== undefined && !isInt(c.lvl, 1, 1000)) return null;
+  if (c.lvl !== undefined && !isInt(c.lvl, 1, 100000)) return null;
   if (c.xp !== undefined && !isInt(c.xp, 0, 2500)) return null;
   if (c.pts !== undefined && !isInt(c.pts, 0, 5e7)) return null;
   if (c.st !== undefined) { if (!isObj(c.st)) return null; for (const v of Object.values(c.st)) if (!isInt(v, 0, 1e8)) return null; }
@@ -128,7 +128,7 @@ const tcOf = r => { const t = [0, 0]; for (const c of r.pl.values()) t[c.tm]++; 
 const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.stringify(o))); } catch (e) { } };
 const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
 const CODES = new Map();   // private code -> room
-function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'ind', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
+function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'arena', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
 function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)]; if (!CODES.has(c)) return c; } return null; }
 function findRoom(team) {
@@ -136,7 +136,8 @@ function findRoom(team) {
   return best || newGeneral();
 }
 const lbOf = r => [...r.pl.values()].map(o => [o.pid, o.k | 0, o.d | 0]);
-const MAPS = ['ind', 'des', 'cit'], PVMAPS = ['pv1', 'pv2', 'pv3'], mapsOf = r => (r.pvp ? PVMAPS : MAPS), VOTE_MS = Number(process.env.VOTE_MS) || 10000, RES_MS = Number(process.env.RES_MS) || 6000;
+/* Update 4: the six maps. Every room votes between the same six; the game itself loads the small PvP version or the large main version */
+const MAPS = ['arena', 'dock', 'metro', 'neon', 'frost', 'outpost'], PVMAPS = MAPS, mapsOf = r => (r.pvp ? PVMAPS : MAPS), VOTE_MS = Number(process.env.VOTE_MS) || 10000, RES_MS = Number(process.env.RES_MS) || 6000;
 const vcount = r => { const v = {}; mapsOf(r).forEach(k => { v[k] = 0; }); for (const m of r.votes.values()) if (v[m] !== undefined) v[m]++; return v; };
 function endRound(r, win) {
   if (r.ph !== 'play') return;
@@ -157,7 +158,7 @@ const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.
 let pvpN = 0;
 function pvpRoom(n) {
   for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait' && r.pl.size < 2 * n) return r;
-  const r = newRoom('pvp-' + (++pvpN), 'PVP ' + n + 'V' + n, ''); r.pvp = n; r.map = 'pv1'; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; return r;
+  const r = newRoom('pvp-' + (++pvpN), 'PVP ' + n + 'V' + n, ''); r.pvp = n; r.map = 'arena'; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; return r;
 }
 const pvpAlive = (r, t) => { let n = 0; for (const o of r.pl.values()) if (o.tm === t && o.pa) n++; return n; };
 function pvpEnd(r, win, force) {
