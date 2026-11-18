@@ -87,3 +87,7 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 - Old map names (`ind`, `des`, `cit`, `pv1`, `pv2`, `pv3`) are no longer accepted for votes or room settings.
 - Upload `server.js` and `README.md` to GitHub, then press Manual Deploy on Render.
 - There is no maximum level (the server accepts levels up to 100000). Prestige still tops out at 10, reached at level 1000.
+
+
+### PvP loadout break
+The break between PvP rounds is now 15 seconds by default (env `PVP_BREAK`, milliseconds) so players can change weapons on the loadout screen.
