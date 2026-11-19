@@ -96,8 +96,8 @@ function cleanSave(o) {
   if (c.pts !== undefined && !isInt(c.pts, 0, 5e7)) return null;
   if (c.st !== undefined) { if (!isObj(c.st)) return null; for (const v of Object.values(c.st)) if (!isInt(v, 0, 1e8)) return null; }
   for (const k of ['own', 'eq', 'up', 'inv', 'camp', 'sk', 'dq']) if (c[k] !== undefined && !isObj(c[k])) return null;
-  if (c.own) for (const v of Object.values(c.own)) if (!isObj(v) || Object.keys(v).length > 60) return null;
-  if (JSON.stringify(c).length > 30000) return null;
+  if (c.own) for (const v of Object.values(c.own)) if (!isObj(v) || Object.keys(v).length > 2000) return null;
+  if (JSON.stringify(c).length > 150000) return null;
   return c;
 }
 // Progress allowed since the last accepted save: a generous base plus a fair rate per second.
@@ -207,8 +207,9 @@ function wsMsg(c, m) {
   if (m.t === 'ping') return wsOut(c, { t: 'pong' });
   if (!c.room) {
     if (m.t !== 'join' || c.joining) return; c.joining = true;
-    store.sessionUser(sha(String(m.token || ''))).then(u => {
+    store.sessionUser(sha(String(m.token || ''))).then(async u => {
       if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
+      let pr = 0; try { const sv = await store.getSave(u.id); if (sv && sv.data) pr = Math.max(0, Math.min(10, Math.floor((Number(JSON.parse(sv.data).lvl) || 1) / 100))); } catch (e) { }
       const adm = isAdmin(u.name), old = USERS.get(u.id);
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
       const team = m.team === 1 ? 1 : 0;
@@ -222,12 +223,12 @@ function wsMsg(c, m) {
       if (r.pl.size >= (r.co ? COMAX : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.k = 0; c.d = 0;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.pr = pr; c.k = 0; c.d = 0;
       if (!r.host) { r.host = pid; r.hs = Date.now(); }
-      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch }));
+      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
       r.pl.set(pid, c);
       wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0 });
-      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
+      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0 } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
       if (r.pvp && r.ph === 'wait') { pvpQ(r); if (r.pl.size >= 2 * r.pvp) pvpFull(r); }
     }).catch(() => wsDrop(c));
     return;
@@ -278,7 +279,7 @@ function wsMsg(c, m) {
   } else if (m.t === 'hit') {
     if (now - c.lh < 12) return; c.lh = now; if (r.pvp && r.ph !== 'play') return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
-    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 250))) return;
+    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
     wsOut(v, { t: 'hit', from: c.pid, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'hit2' && r.host === c.pid) {
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
@@ -286,7 +287,7 @@ function wsMsg(c, m) {
     wsOut(v, { t: 'hit', from: -1, d, bn: String(m.bn || 'BOT').slice(0, 30) });
   } else if (m.t === 'bh' && r.host !== c.pid) {
     const h = r.pl.get(r.host), d = Math.round(Number(m.d)), i = m.i | 0;
-    if (!h || i < 0 || i > 19 || !(d >= 1 && d <= 250)) return;
+    if (!h || i < 0 || i > 19 || !(d >= 1 && d <= 1000)) return;
     wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'kl') {
     if (r.ph !== 'play') return;

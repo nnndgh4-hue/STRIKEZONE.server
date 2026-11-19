@@ -91,3 +91,8 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 
 ### PvP loadout break
 The break between PvP rounds is now 15 seconds by default (env `PVP_BREAK`, milliseconds) so players can change weapons on the loadout screen.
+
+## Update 5 notes
+- Saves may now hold many more weapons and skins (up to 2000 entries per group and 150 KB per save).
+- Prestige (level / 100, max 10) is read from the player's saved level and sent to other players in the room so it can show next to name tags.
+- Hits in general servers may be up to 1000 damage (new sniper rifles). PvP is still capped at 500.
