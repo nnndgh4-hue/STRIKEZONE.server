@@ -17,6 +17,7 @@ if (process.env.DATABASE_URL) {
       await pool.query(`CREATE TABLE IF NOT EXISTS saves(uid INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL, upd BIGINT NOT NULL)`);
       await pool.query('ALTER TABLE saves ADD COLUMN IF NOT EXISTS at BIGINT');
       await pool.query(`CREATE TABLE IF NOT EXISTS lb(uid INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, pts BIGINT NOT NULL DEFAULT 0, day TEXT NOT NULL DEFAULT '', dpts BIGINT NOT NULL DEFAULT 0)`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
       await pool.query(`CREATE TABLE IF NOT EXISTS titles(lname TEXT PRIMARY KEY, name TEXT NOT NULL, txt TEXT NOT NULL, col TEXT NOT NULL)`);
       const miss = await pool.query('SELECT u.id,u.name,s.data FROM saves s JOIN users u ON u.id=s.uid WHERE u.id NOT IN (SELECT uid FROM lb)');
       for (const r of miss.rows) { let p = 0; try { p = Math.max(0, Math.round(JSON.parse(r.data).pts || 0)); } catch (e) { } await pool.query('INSERT INTO lb(uid,name,pts) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [r.id, r.name, p]); }
@@ -37,12 +38,15 @@ if (process.env.DATABASE_URL) {
     async lbMe(uid, day) { const r = await pool.query('SELECT pts,day,dpts FROM lb WHERE uid=$1', [uid]); const m = r.rows[0]; if (!m) return null; const a = await pool.query('SELECT COUNT(*) c FROM lb WHERE pts>$1', [m.pts]); const dp = m.day === day ? Number(m.dpts) : 0; let dr = 0; if (dp > 0) { const b = await pool.query('SELECT COUNT(*) c FROM lb WHERE day=$1 AND dpts>$2', [day, dp]); dr = Number(b.rows[0].c) + 1; } return { rank: Number(a.rows[0].c) + 1, pts: Number(m.pts), drank: dr, dpts: dp }; },
     async titlesAll() { const r = await pool.query('SELECT lname,name,txt,col FROM titles'); return r.rows; },
     async titleSet(lname, name, txt, col) { await pool.query('INSERT INTO titles(lname,name,txt,col) VALUES($1,$2,$3,$4) ON CONFLICT(lname) DO UPDATE SET name=$2,txt=$3,col=$4', [lname, name, txt, col]); },
-    async titleDel(lname) { await pool.query('DELETE FROM titles WHERE lname=$1', [lname]); }
+    async titleDel(lname) { await pool.query('DELETE FROM titles WHERE lname=$1', [lname]); },
+    async kvGet(k) { const r = await pool.query('SELECT v FROM kv WHERE k=$1', [k]); return r.rows[0] ? r.rows[0].v : null; },
+    async kvSet(k, v) { await pool.query('INSERT INTO kv(k,v) VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET v=$2', [k, v]); },
+    async kvDel(k) { await pool.query('DELETE FROM kv WHERE k=$1', [k]); }
   };
 } else {
   let db = { n: 1, users: {}, saves: {}, sessions: {} };
   try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
-  db.lb = db.lb || {}; db.titles = db.titles || {};
+  db.lb = db.lb || {}; db.titles = db.titles || {}; db.kv = db.kv || {};
   let t = null; const flush = () => { clearTimeout(t); t = setTimeout(() => { try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch (e) { console.error('save failed', e.message); } }, 300); };
   store = {
     async init() {},
@@ -59,7 +63,10 @@ if (process.env.DATABASE_URL) {
     async lbMe(uid, day) { const m = db.lb[uid]; if (!m) return null; const all = Object.values(db.lb); const dp = m.day === day ? m.dpts : 0; return { rank: all.filter(x => x.pts > m.pts).length + 1, pts: m.pts, drank: dp > 0 ? all.filter(x => x.day === day && x.dpts > dp).length + 1 : 0, dpts: dp }; },
     async titlesAll() { return Object.entries(db.titles).map(([l, x]) => ({ lname: l, name: x.name, txt: x.txt, col: x.col })); },
     async titleSet(lname, name, txt, col) { db.titles[lname] = { name, txt, col }; flush(); },
-    async titleDel(lname) { delete db.titles[lname]; flush(); }
+    async titleDel(lname) { delete db.titles[lname]; flush(); },
+    async kvGet(k) { return Object.prototype.hasOwnProperty.call(db.kv, k) ? db.kv[k] : null; },
+    async kvSet(k, v) { db.kv[k] = v; flush(); },
+    async kvDel(k) { delete db.kv[k]; flush(); }
   };
   for (const [l, u] of Object.entries(db.users)) { const sv = db.saves[u.id]; if (sv && !db.lb[u.id]) { let p = 0; try { p = Math.max(0, Math.round(JSON.parse(sv.data).pts || 0)); } catch (e) { } db.lb[u.id] = { name: u.name, pts: p, day: '', dpts: 0 }; } }
 }
@@ -72,6 +79,7 @@ const send = (res, code, obj) => { res.writeHead(code, Object.assign({ 'Content-
 const body = req => new Promise((res, rej) => { let n = 0; const c = []; req.on('data', d => { n += d.length; if (n > MAX_BODY) { rej(new Error('too big')); req.destroy(); } else c.push(d); }); req.on('end', () => { try { res(JSON.parse(Buffer.concat(c).toString() || '{}')); } catch (e) { rej(new Error('bad json')); } }); req.on('error', rej); });
 const hits = new Map();   // simple per-IP limit on login/register
 /* live events: the admin posts one, every player's game polls for new ones (kept in memory for 2 minutes) */
+let LIVE = null;   // { n: name, end: ms timestamp, set: ms timestamp } or null
 const EVS = [], EVT = new Set(['boss','superspeed','supergravity','enlarge','meteor','coinrain','disco','tacoparty','infammo','ufo','dev']);
 let evSeq = 0, lastEv = 0;
 const limited = ip => { const now = Date.now(), a = (hits.get(ip) || []).filter(x => now - x < 600000); a.push(now); hits.set(ip, a); return a.length > 25; };
@@ -107,7 +115,8 @@ const isAdmin = n => ADMINS.includes(String(n || '').toLowerCase());
 /* "today" for the daily leaderboard follows Adelaide time (set LB_TZ on Render to change) */
 const LB_TZ = process.env.LB_TZ || 'Australia/Adelaide';
 const dayKey = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: LB_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch (e) { return new Date().toISOString().slice(0, 10); } };
-const TITLES = new Map();   // lowercase username -> { n, t, c }
+const TITLES = new Map();
+const titleOf = n => { const t = TITLES.get(String(n || '').toLowerCase()); return t ? [t.t, t.c] : null; };   // lowercase username -> { n, t, c }
 const HEX = /^#[0-9a-fA-F]{6}$/;
 let lbCache = null, lbCacheAt = 0;
 
@@ -126,7 +135,7 @@ let roomN = 0;
 const wsFrame = (str, op) => { const p = Buffer.from(str), n = p.length; let h; if (n < 126) h = Buffer.from([0x80 | (op || 1), n]); else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x80 | (op || 1); h[1] = 126; h.writeUInt16BE(n, 2); } else { h = Buffer.alloc(10); h[0] = 0x80 | (op || 1); h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); } return Buffer.concat([h, p]); };
 const tcOf = r => { const t = [0, 0]; for (const c of r.pl.values()) t[c.tm]++; return t; };
 const wsOut = (c, o) => { if (c.dead) return; try { c.sock.write(wsFrame(JSON.stringify(o))); } catch (e) { } };
-const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } };
+const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (const c of r.pl.values()) if (c !== skip && !c.dead) { try { c.sock.write(f); } catch (e) { } } if (r.sp) for (const c of r.sp) if (!c.dead) { try { c.sock.write(f); } catch (e) { } } };
 const CODES = new Map();   // private code -> room
 function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'arena', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
@@ -154,7 +163,7 @@ function startRound(r) {
 }
 function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; for (const o of r.pl.values()) { if (!r.pvp) { o.k = 0; o.d = 0; } o.pa = true; } }
 /* ---------- PvP queues: 1v1 / 2v2 / 3v3, no bots, one life per round, first to 3 round wins ---------- */
-const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.env.PVP_BREAK) || 15000, PVP_WINS = 3, PVP_MAXR = 9;
+const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.env.PVP_BREAK) || 10000, PVP_WINS = 3, PVP_MAXR = 9;
 let pvpN = 0;
 function pvpRoom(n) {
   for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait' && r.pl.size < 2 * n) return r;
@@ -192,8 +201,8 @@ function pvpFull(r) { r.ph = 'vote'; r.vend = Date.now() + VOTE_MS; r.votes.clea
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
   if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); }
-  const r = c.room; if (!r) return; r.pl.delete(c.pid);
-  if (!r.pl.size) { ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
+  const r = c.room; if (!r) return; if (c.spec) { if (r.sp) r.sp.delete(c); return; } r.pl.delete(c.pid);
+  if (!r.pl.size) { if (r.sp) for (const sp of [...r.sp]) { wsOut(sp, { t: 'err', m: 'That match has ended.', soft: 1 }); setTimeout(() => wsDrop(sp), 300); } ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
   roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
   if (r.pvp) { if (r.ph === 'wait') pvpQ(r); else pvpCheck(r); }
   if (r.co) coCheck(r);
@@ -202,6 +211,24 @@ function wsDrop(c) {
 function fixHost(r) { const h = r.pl.get(r.host); if (!h || h.vis !== 0) return; const n = [...r.pl.values()].find(o => o.vis !== 0); if (n) { r.host = n.pid; r.hs = Date.now(); roomOut(r, { t: 'h', host: n.pid }); } }
 const num = (v, lim) => { v = Number(v); return Number.isFinite(v) ? Math.max(-lim, Math.min(lim, Math.round(v * 100) / 100)) : 0; };
 const USERS = new Map();   // user id -> client (one connection per account)
+/* ---------- chat filter: swear words become hashtags (####) for everybody ---------- */
+const LEET = { a: '[a@4*]', e: '[e3*]', i: '[i1!|*]', o: '[o0*]', u: '[uv*]', s: '[s$5]', t: '[t7+]', l: '[l1|]', b: '[b8]', g: '[g9]' };
+const swPat = w => [...w].map(ch => (LEET[ch] || ch) + '+').join('[.\\-_*]?');
+const SW_OPEN = ['fuck', 'shit', 'bitch', 'cunt', 'bullshit', 'motherfucker'], SW_WHOLE = ['dick', 'cock', 'pussy', 'whore', 'slut', 'prick', 'twat', 'wank', 'wanker', 'bollocks', 'asshole', 'ass', 'arse', 'bastard', 'nigger', 'nigga', 'fag', 'faggot', 'retard', 'piss', 'damn', 'crap', 'douche', 'jackass', 'dumbass', 'cum', 'tits'];
+const SW_RE = new RegExp('(?<![a-z0-9])(?:' + SW_OPEN.map(w => swPat(w) + '[a-z]*').join('|') + '|(?:' + SW_WHOLE.map(swPat).join('|') + ')(?:s|es|ed|ing|er|ers|y)?)(?![a-z0-9])', 'gi');
+const cleanChat = tx => tx.replace(SW_RE, m => '#'.repeat(m.length));
+/* ---------- presence: everybody who has the game open (even on the home page) ---------- */
+const PRES = new Map();
+function presN() { const t = Date.now(); for (const [k, v] of PRES) if (t - v > 50000) PRES.delete(k); return PRES.size; }
+function onlineInfo() {
+  const rooms = [], pq = [];
+  for (const r of ROOMS.values()) {
+    if (r.code || !r.pl.size || (r.pvp && r.ph === 'wait')) continue;
+    rooms.push({ id: r.id, name: r.name, kind: r.pvp ? 'pvp' : r.co ? 'co' : 'gen', map: r.map, ph: r.ph, n: r.pl.size, tc: tcOf(r), rw: r.rw || [0, 0], rn: r.rn | 0, sp: r.sp ? r.sp.size : 0, pl: [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm })) });
+  }
+  for (const n of [1, 2, 3]) { let w = null; for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait') { w = r; break; } pq.push({ n, have: w ? w.pl.size : 0, need: 2 * n, names: w ? [...w.pl.values()].map(o => o.name) : [] }); }
+  return { n: presN(), rooms, pq };
+}
 function wsMsg(c, m) {
   if (c.dead || !m || typeof m.t !== 'string') return;
   if (m.t === 'ping') return wsOut(c, { t: 'pong' });
@@ -213,6 +240,13 @@ function wsMsg(c, m) {
       const adm = isAdmin(u.name), old = USERS.get(u.id);
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
       const team = m.team === 1 ? 1 : 0;
+      if (m.spec) {
+        const sr = ROOMS.get(String(m.spec).slice(0, 40));
+        if (!sr || sr.code || (sr.pvp && sr.ph === 'wait')) return soft('That match is not available to watch.');
+        c.user = u; c.room = sr; c.spec = true; c.pid = -1; c.name = u.name; c.tm = 0; (sr.sp = sr.sp || new Set()).add(c);
+        const sl = [...sr.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
+        return wsOut(c, { t: 'w', id: -1, spec: 1, room: sr.id, name: sr.name, priv: 0, code: '', co: sr.co ? 1 : 0, cw: sr.cw | 0, host: sr.host, tm: 0, pl: sl, tc: tcOf(sr), el: Date.now() - sr.t0, sc: sr.sc, lb: lbOf(sr), map: sr.map, ph: sr.ph, vl: Math.max(0, sr.vend - Date.now()), vt: vcount(sr), pvp: sr.pvp | 0, need: sr.pvp ? 2 * sr.pvp : 0, rw: sr.rw || [0, 0], rn: sr.rn | 0 });
+      }
       let r = null;
       if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
@@ -233,10 +267,11 @@ function wsMsg(c, m) {
     }).catch(() => wsDrop(c));
     return;
   }
+  if (c.spec) return;   /* spectators only watch */
   const r = c.room, now = Date.now();
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
-    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(40, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
+    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(63, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
   } else if (m.t === 'adm') {
     if (!c.admin) return;
     const cm = String(m.c || '');
@@ -271,9 +306,9 @@ function wsMsg(c, m) {
     roomOut(r, { t: 'dp', i: c.pid, id }, c);
   } else if (m.t === 'fx') {
     if (now - (c.lf || 0) < 40) return; c.lf = now;
-    roomOut(r, { t: 'fx', i: c.pid, w: Math.max(0, Math.min(40, m.w | 0)) }, c);
+    roomOut(r, { t: 'fx', i: c.pid, w: Math.max(0, Math.min(63, m.w | 0)) }, c);
   } else if (m.t === 'c') {
-    const tx = String(m.m || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120);
+    const tx = cleanChat(String(m.m || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120));
     if (!tx || now - (c.lc || 0) < 700) return; c.lc = now;
     roomOut(r, { t: 'c', i: c.pid, n: c.name, tm: c.tm, m: tx });
   } else if (m.t === 'hit') {
@@ -356,6 +391,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
     const url = req.url.split('?')[0], ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file', rooms: ROOMS.size, online: USERS.size });
+    if (url === '/api/online' && req.method === 'GET') {
+      const id = (new URL(req.url, 'http://x').searchParams.get('id') || '').replace(/[^\w-]/g, '').slice(0, 24);
+      if (id && (PRES.has(id) || PRES.size < 5000)) PRES.set(id, Date.now());
+      return send(res, 200, onlineInfo());
+    }
     if (url === '/api/rooms' && req.method === 'GET') {
       const now = Date.now(), list = [...ROOMS.values()].filter(r => !r.priv).map(r => ({ id: r.id, name: r.name, n: r.pl.size, tc: tcOf(r), el: now - r.t0, sc: r.sc, ph: r.ph, map: r.map }));
       if (!list.some(r => r.n < MAXP)) list.push({ id: '', name: 'NEW GENERAL SERVER', n: 0, tc: [0, 0], el: 0, sc: [0, 0] });
@@ -390,6 +430,21 @@ const server = http.createServer(async (req, res) => {
       EVS.push(e); while (EVS.length > 100 || (EVS.length && e.ts - EVS[0].ts > 120000)) EVS.shift();
       return send(res, 200, { ok: true, seq: evSeq });
     }
+    /* the event timer: the admin starts a named countdown, everybody's home screen polls GET /api/live. It is saved in the database so it survives restarts. */
+    if (url === '/api/live' && req.method === 'GET') return send(res, 200, { now: Date.now(), ev: LIVE });
+    if (url === '/api/live' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req);
+      if (b.action === 'stop') { LIVE = null; await store.kvDel('live'); return send(res, 200, { ok: true, now: Date.now(), ev: null }); }
+      if (b.action !== 'start') return send(res, 400, { error: 'Unknown action.' });
+      const nm = String(b.name || '').replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      if (!nm) return send(res, 400, { error: 'Type a name for the event.' });
+      const ms = Math.round(Number(b.ms));
+      if (!(ms >= 0) || ms > 366 * 864e5) return send(res, 400, { error: 'The timer must be between 0 and 366 days.' });
+      LIVE = { n: nm, end: Date.now() + ms, set: Date.now() };
+      await store.kvSet('live', JSON.stringify(LIVE));
+      return send(res, 200, { ok: true, now: Date.now(), ev: LIVE });
+    }
     if (url === '/api/events' && req.method === 'GET') {
       const since = Number((req.url.split('since=')[1] || '').split('&')[0]), now = Date.now();
       const list = EVS.filter(e => (since >= 0 ? e.seq > since : now - e.ts < 15000) && now - e.ts < 60000).map(e => ({ seq: e.seq, id: e.id, type: e.type, data: e.data, age: now - e.ts }));
@@ -398,7 +453,7 @@ const server = http.createServer(async (req, res) => {
     if (url === '/api/leaderboard' && req.method === 'GET') {
       const day = dayKey(), nowt = Date.now();
       if (!lbCache || lbCache.day !== day || nowt - lbCacheAt > 20000) { lbCache = { day, g: await store.lbTop(100), d: await store.lbDay(day, 10) }; lbCacheAt = nowt; }
-      const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p })), d: lbCache.d.map(x => ({ n: x.n, p: x.p })), me: null };
+      const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), d: lbCache.d.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), me: null };
       const u = await auth(req); if (u) out.me = await store.lbMe(u.id, day);
       return send(res, 200, out);
     }
@@ -413,6 +468,29 @@ const server = http.createServer(async (req, res) => {
       const col = HEX.test(String(b.color || '')) ? String(b.color).toLowerCase() : '#ffd400';
       await store.titleSet(un.toLowerCase(), target.name, txt, col); TITLES.set(un.toLowerCase(), { n: target.name, t: txt, c: col });
       return send(res, 200, { ok: true, user: target.name, text: txt, color: col });
+    }
+    /* admin coin gifts: the admin gives coins to a username, they wait in the database until that player's game claims them */
+    if (url === '/api/gift' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), un = String(b.user || '').trim(), n = Math.round(Number(b.amount));
+      if (!NAME.test(un)) return send(res, 400, { error: 'Type the exact username of the player.' });
+      if (!(n >= 1) || n > 1000000) return send(res, 400, { error: 'The amount must be between 1 and 1,000,000 coins.' });
+      const target = await store.userByName(un.toLowerCase()); if (!target) return send(res, 404, { error: 'No player has that username.' });
+      const k = 'gift:' + target.name.toLowerCase(), cur = Math.max(0, Math.round(Number(await store.kvGet(k)) || 0));
+      await store.kvSet(k, String(Math.min(cur + n, 5e7)));
+      return send(res, 200, { ok: true, user: target.name, amount: n });
+    }
+    if (url === '/api/gift' && req.method === 'GET') {
+      const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+      return send(res, 200, { n: Math.max(0, Math.round(Number(await store.kvGet('gift:' + u.name.toLowerCase())) || 0)) });
+    }
+    if (url === '/api/gift/claim' && req.method === 'POST') {
+      const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+      const k = 'gift:' + u.name.toLowerCase(), n = Math.max(0, Math.round(Number(await store.kvGet(k)) || 0));
+      if (!n) return send(res, 200, { n: 0 });
+      await store.kvDel(k);
+      try { const prev = await store.getSave(u.id); if (prev) { const d = JSON.parse(prev.data); d.coins = Math.min(5e7, Math.round((d.coins || 0) + n)); await store.putSave(u.id, JSON.stringify(d), prev.upd, prev.at); } } catch (e) { console.error('gift', e.message); }
+      return send(res, 200, { n });
     }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
@@ -441,5 +519,5 @@ server.on('upgrade', (req, sock, head) => {
     wsOpen(sock, head);
   } catch (e) { try { sock.destroy(); } catch (x) { } }
 });
-store.init().then(async () => { for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
+store.init().then(async () => { for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); try { const l = JSON.parse(await store.kvGet('live') || 'null'); if (l && typeof l.n === 'string' && Number.isFinite(l.end)) LIVE = l; } catch (e) { } }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
   .catch(e => { console.error('Startup failed:', e.message); process.exit(1); });

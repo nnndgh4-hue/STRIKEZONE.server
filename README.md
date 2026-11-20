@@ -71,7 +71,9 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 "ONLINE CO-OP" (from PLAY when the mode is Wave Survival) joins a co-op room: up to 6 players, all on one team, host's game runs the enemies, one life each. If every player is down the room restarts from wave 1 after 5 s. Co-op rooms are not in the server list; private co-op rooms use a code like any private server.
 
 ## Leaderboards and titles
-- GET /api/leaderboard: global top 100 (total points) and today's top 10 (points earned today, resets at midnight Adelaide time; set LB_TZ to change). Send the login token to also get your own rank. Players appear after their first cloud save.
+- GET /api/leaderboard: global top 100 (total points) and today's top 10 (points earned today, resets at midnight Adelaide time; set LB_TZ to change). Send the login token to also get your own rank. Players appear after their first cloud save. Each entry now carries `t` (the player's title) so name tags load together with the board.
+- POST /api/gift (admin only): `{user,amount}` 1..1,000,000 gives coins to any existing username (including the admin). The coins are queued and claimed by that player's game (GET /api/gift, POST /api/gift/claim, token required), which bumps their saved coins.
+- Weapon ids up to 63 are accepted in fx/state messages (new melee weapons).
 - Admin only: POST /api/title {user, text, color} sets a title (up to 16 characters, colour like #ffd400); empty text removes it. GET /api/titles lists them. New tables (lb, titles) are created automatically.
 
 
@@ -90,9 +92,26 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 
 
 ### PvP loadout break
-The break between PvP rounds is now 15 seconds by default (env `PVP_BREAK`, milliseconds) so players can change weapons on the loadout screen.
+The break between PvP rounds is now 10 seconds by default (env `PVP_BREAK`, milliseconds) so players can change weapons on the loadout screen.
 
 ## Update 5 notes
 - Saves may now hold many more weapons and skins (up to 2000 entries per group and 150 KB per save).
 - Prestige (level / 100, max 10) is read from the player's saved level and sent to other players in the room so it can show next to name tags.
 - Hits in general servers may be up to 1000 damage (new sniper rifles). PvP is still capped at 500.
+
+## Event timer (V81)
+
+The admin (`AlphaNG7`, or whoever is in `ADMIN_USERS`) can start a named countdown from the home screen (EVENT TIMER (ADMIN)) or the command center (EVENT button). The server stores it in a new `kv` table (created automatically; with no database it is kept in the data file) so it survives restarts.
+
+- `GET /api/live` returns `{now, ev}` where `ev` is `{n, end, set}` or `null`. Every open game polls it about every 20 seconds and corrects for clock differences using `now`.
+- `POST /api/live` (admin only) with `{action:'start', name, ms}` starts the timer (name up to 60 characters, `ms` between 0 and 366 days) or `{action:'stop'}` removes it. After the timer ends the bubble says EVENT HAPPENING NOW until the admin stops it.
+
+After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest commit).
+
+## Online hub (V82)
+
+- **Chat filter:** swear words in chat are replaced with `#` characters on the server, so it works for every player, including older game versions.
+- **Currently online:** the game calls `GET /api/online?id=<random tab id>` about every 20 seconds (every 5 seconds while the ONLINE tab is open). Everyone who called it in the last 50 seconds counts as online, even on the home page. Nothing about the person is stored. The reply also lists the live public servers and PvP matches with their players, plus the PvP waiting groups (`pq`).
+- **Watching:** a logged-in player can join a live public server or running PvP match as a spectator (`join` with `spec: roomId`). Spectators receive positions and bots but cannot move, shoot, chat, vote or take a slot, and private-code servers and PvP rooms still waiting for players cannot be watched. If the match empties, spectators are sent back to the menu.
+
+After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest commit).
