@@ -74,6 +74,8 @@ Players join a PvP queue (1v1, 2v2 or 3v3) from the ONLINE panel. When the queue
 - GET /api/leaderboard: global top 100 (total points) and today's top 10 (points earned today, resets at midnight Adelaide time; set LB_TZ to change). Send the login token to also get your own rank. Players appear after their first cloud save. Each entry now carries `t` (the player's title) so name tags load together with the board.
 - POST /api/gift (admin only): `{user,amount}` 1..1,000,000 gives coins to any existing username (including the admin). The coins are queued and claimed by that player's game (GET /api/gift, POST /api/gift/claim, token required), which bumps their saved coins.
 - Weapon ids up to 63 are accepted in fx/state messages (new melee weapons).
+- Admin moderation (admin only): GET /api/admin/users?q= searches players; POST /api/admin/ban `{user,banned}` bans or unbans (kept in kv `bans`). A banned account keeps its save and is hidden from the leaderboard; login, save and live play answer 403 `banned:true` and the game shows a YOU HAVE BEEN BANNED screen. POST /api/admin/reset `{user}` wipes that account's save and leaderboard row and stamps it (`rst`) so every device of that account wipes its local copy too.
+- On boot the accounts `nate` and `nihdih` are reset once (kv `autoreset1:<name>`), if they exist.
 - Admin only: POST /api/title {user, text, color} sets a title (up to 16 characters, colour like #ffd400); empty text removes it. GET /api/titles lists them. New tables (lb, titles) are created automatically.
 
 

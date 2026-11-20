@@ -39,6 +39,9 @@ if (process.env.DATABASE_URL) {
     async titlesAll() { const r = await pool.query('SELECT lname,name,txt,col FROM titles'); return r.rows; },
     async titleSet(lname, name, txt, col) { await pool.query('INSERT INTO titles(lname,name,txt,col) VALUES($1,$2,$3,$4) ON CONFLICT(lname) DO UPDATE SET name=$2,txt=$3,col=$4', [lname, name, txt, col]); },
     async titleDel(lname) { await pool.query('DELETE FROM titles WHERE lname=$1', [lname]); },
+    async delSave(uid) { await pool.query('DELETE FROM saves WHERE uid=$1', [uid]); },
+    async lbDel(uid) { await pool.query('DELETE FROM lb WHERE uid=$1', [uid]); },
+    async listUsers(q, n) { const r = await pool.query('SELECT u.name, COALESCE(l.pts,0) pts FROM users u LEFT JOIN lb l ON l.uid=u.id WHERE u.lname LIKE $1 ORDER BY COALESCE(l.pts,0) DESC, u.id ASC LIMIT $2', ['%' + q.replace(/[%_\\]/g, '') + '%', n]); return r.rows.map(x => ({ n: x.name, p: Number(x.pts) })); },
     async kvGet(k) { const r = await pool.query('SELECT v FROM kv WHERE k=$1', [k]); return r.rows[0] ? r.rows[0].v : null; },
     async kvSet(k, v) { await pool.query('INSERT INTO kv(k,v) VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET v=$2', [k, v]); },
     async kvDel(k) { await pool.query('DELETE FROM kv WHERE k=$1', [k]); }
@@ -64,6 +67,9 @@ if (process.env.DATABASE_URL) {
     async titlesAll() { return Object.entries(db.titles).map(([l, x]) => ({ lname: l, name: x.name, txt: x.txt, col: x.col })); },
     async titleSet(lname, name, txt, col) { db.titles[lname] = { name, txt, col }; flush(); },
     async titleDel(lname) { delete db.titles[lname]; flush(); },
+    async delSave(uid) { delete db.saves[uid]; flush(); },
+    async lbDel(uid) { delete db.lb[uid]; flush(); },
+    async listUsers(q, n) { return Object.values(db.users).filter(u => u.lname.includes(q)).map(u => ({ n: u.name, p: (db.lb[u.id] || {}).pts || 0 })).sort((a, b) => b.p - a.p).slice(0, n); },
     async kvGet(k) { return Object.prototype.hasOwnProperty.call(db.kv, k) ? db.kv[k] : null; },
     async kvSet(k, v) { db.kv[k] = v; flush(); },
     async kvDel(k) { delete db.kv[k]; flush(); }
@@ -116,6 +122,16 @@ const isAdmin = n => ADMINS.includes(String(n || '').toLowerCase());
 const LB_TZ = process.env.LB_TZ || 'Australia/Adelaide';
 const dayKey = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: LB_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch (e) { return new Date().toISOString().slice(0, 10); } };
 const TITLES = new Map();
+/* bans: lowercase usernames, kept in kv 'bans'. A banned account keeps its save but is hidden from the leaderboard and cannot play. */
+const BANS = new Set();
+const isBanned = n => BANS.has(String(n || '').toLowerCase());
+const saveBans = () => store.kvSet('bans', JSON.stringify([...BANS]));
+const BANNED_MSG = 'You have been banned.';
+/* reset: wipes the save and leaderboard row; the stamp makes every device of that account wipe its local copy too */
+async function resetUser(name) {
+  const u = await store.userByName(String(name || '').toLowerCase()); if (!u) return null;
+  await store.delSave(u.id); await store.lbDel(u.id); await store.kvSet('rst:' + u.name.toLowerCase(), String(Date.now())); lbCache = null; return u;
+}
 const titleOf = n => { const t = TITLES.get(String(n || '').toLowerCase()); return t ? [t.t, t.c] : null; };   // lowercase username -> { n, t, c }
 const HEX = /^#[0-9a-fA-F]{6}$/;
 let lbCache = null, lbCacheAt = 0;
@@ -236,6 +252,7 @@ function wsMsg(c, m) {
     if (m.t !== 'join' || c.joining) return; c.joining = true;
     store.sessionUser(sha(String(m.token || ''))).then(async u => {
       if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
+      if (isBanned(u.name)) { wsOut(c, { t: 'err', m: BANNED_MSG }); return wsDrop(c); }
       let pr = 0; try { const sv = await store.getSave(u.id); if (sv && sv.data) pr = Math.max(0, Math.min(10, Math.floor((Number(JSON.parse(sv.data).lvl) || 1) / 100))); } catch (e) { }
       const adm = isAdmin(u.name), old = USERS.get(u.id);
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
@@ -415,6 +432,7 @@ const server = http.createServer(async (req, res) => {
       const b = await body(req), u = await store.userByName(String(b.user || '').toLowerCase()), pw = String(b.pass || '');
       const ok = u && crypto.timingSafeEqual(Buffer.from(await scrypt(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
       if (!ok) return send(res, 401, { error: 'Wrong username or password.' });
+      if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG, banned: true });
       return send(res, 200, { token: await startSession(u), user: u.name, admin: isAdmin(u.name) });
     }
     if (url === '/api/logout' && req.method === 'POST') { const h = req.headers.authorization || ''; if (h.startsWith('Bearer ')) await store.delSession(sha(h.slice(7))); return send(res, 200, { ok: true }); }
@@ -452,9 +470,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (url === '/api/leaderboard' && req.method === 'GET') {
       const day = dayKey(), nowt = Date.now();
-      if (!lbCache || lbCache.day !== day || nowt - lbCacheAt > 20000) { lbCache = { day, g: await store.lbTop(100), d: await store.lbDay(day, 10) }; lbCacheAt = nowt; }
+      if (!lbCache || lbCache.day !== day || nowt - lbCacheAt > 20000) { lbCache = { day, g: (await store.lbTop(100 + BANS.size)).filter(x => !isBanned(x.n)).slice(0, 100), d: (await store.lbDay(day, 10 + BANS.size)).filter(x => !isBanned(x.n)).slice(0, 10) }; lbCacheAt = nowt; }
       const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), d: lbCache.d.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), me: null };
-      const u = await auth(req); if (u) out.me = await store.lbMe(u.id, day);
+      const u = await auth(req); if (u && !isBanned(u.name)) out.me = await store.lbMe(u.id, day);
       return send(res, 200, out);
     }
     if (url === '/api/titles' && req.method === 'GET') { const t = {}; for (const [k, v] of TITLES) t[k] = [v.t, v.c]; return send(res, 200, { titles: t }); }
@@ -470,6 +488,23 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, user: target.name, text: txt, color: col });
     }
     /* admin coin gifts: the admin gives coins to a username, they wait in the database until that player's game claims them */
+    if (url === '/api/admin/users' && req.method === 'GET') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const q = String((new URL(req.url, 'http://x')).searchParams.get('q') || '').toLowerCase().slice(0, 30);
+      const list = await store.listUsers(q, 60); return send(res, 200, { users: list.map(x => ({ n: x.n, p: x.p, b: isBanned(x.n) })), banned: [...BANS] });
+    }
+    if (url === '/api/admin/ban' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), un = String(b.user || '').trim(), t = await store.userByName(un.toLowerCase()); if (!t) return send(res, 404, { error: 'No player has that username.' });
+      if (isAdmin(t.name)) return send(res, 400, { error: 'You cannot ban an admin.' });
+      if (b.banned) BANS.add(t.name.toLowerCase()); else BANS.delete(t.name.toLowerCase());
+      await saveBans(); lbCache = null; return send(res, 200, { ok: true, user: t.name, banned: !!b.banned });
+    }
+    if (url === '/api/admin/reset' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), t = await resetUser(String(b.user || '').trim()); if (!t) return send(res, 404, { error: 'No player has that username.' });
+      return send(res, 200, { ok: true, user: t.name });
+    }
     if (url === '/api/gift' && req.method === 'POST') {
       const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
       const b = await body(req), un = String(b.user || '').trim(), n = Math.round(Number(b.amount));
@@ -494,9 +529,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
-      if (req.method === 'GET') { const s = await store.getSave(u.id); return send(res, 200, { user: u.name, admin: isAdmin(u.name), save: s ? JSON.parse(s.data) : null, upd: s ? s.upd : 0 }); }
+      if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG, banned: true });
+      const rst = await store.kvGet('rst:' + u.name.toLowerCase());
+      if (req.method === 'GET') { const s = await store.getSave(u.id); return send(res, 200, { user: u.name, admin: isAdmin(u.name), save: s ? JSON.parse(s.data) : null, upd: s ? s.upd : 0, rst: rst || '' }); }
       if (req.method === 'PUT') {
         const b = await body(req), save = cleanSave(b.save); if (!save) return send(res, 400, { error: 'Invalid save.' });
+        if (rst && String(b.rst || '') !== rst) return send(res, 409, { error: 'This account was reset.', rst });
         const now = Date.now(), prev = await store.getSave(u.id), upd = Math.min(Number(b.upd) || now, now + 60000);
         if (!isAdmin(u.name) && !plausible(save, prev, now)) return send(res, 422, { error: 'That save has progress that is not possible, so your last valid progress was restored.', save: prev ? JSON.parse(prev.data) : null, upd: prev ? prev.upd : 0 });
         await store.putSave(u.id, JSON.stringify(save), upd, now);
@@ -519,5 +557,5 @@ server.on('upgrade', (req, sock, head) => {
     wsOpen(sock, head);
   } catch (e) { try { sock.destroy(); } catch (x) { } }
 });
-store.init().then(async () => { for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); try { const l = JSON.parse(await store.kvGet('live') || 'null'); if (l && typeof l.n === 'string' && Number.isFinite(l.end)) LIVE = l; } catch (e) { } }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
+store.init().then(async () => { try { for (const n of JSON.parse(await store.kvGet('bans') || '[]')) BANS.add(String(n).toLowerCase()); for (const n of ['nate', 'nihdih']) if (!(await store.kvGet('autoreset1:' + n))) { const r = await resetUser(n); console.log('reset', n, r ? 'done' : 'no such user yet'); if (r) await store.kvSet('autoreset1:' + n, '1'); } } catch (e) { console.error('boot', e.message); } for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); try { const l = JSON.parse(await store.kvGet('live') || 'null'); if (l && typeof l.n === 'string' && Number.isFinite(l.end)) LIVE = l; } catch (e) { } }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
   .catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
