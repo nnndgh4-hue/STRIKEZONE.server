@@ -216,7 +216,7 @@ function pvpQ(r) { roomOut(r, { t: 'pq', have: r.pl.size, need: 2 * r.pvp, names
 function pvpFull(r) { r.ph = 'vote'; r.vend = Date.now() + VOTE_MS; r.votes.clear(); r.rw = [0, 0]; r.rn = 0; roomOut(r, { t: 'pv', vl: VOTE_MS, need: 2 * r.pvp }); }
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
-  if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); }
+  if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); if (SOLOS.get(c.user.id) === c) SOLOS.delete(c.user.id); }
   const r = c.room; if (!r) return; if (c.spec) { if (r.sp) r.sp.delete(c); return; } r.pl.delete(c.pid);
   if (!r.pl.size) { if (r.sp) for (const sp of [...r.sp]) { wsOut(sp, { t: 'err', m: 'That match has ended.', soft: 1 }); setTimeout(() => wsDrop(sp), 300); } ROOMS.delete(r.id); if (r.code) CODES.delete(r.code); return; }
   roomOut(r, { t: 'pl', id: c.pid }); roomOut(r, { t: 'tc', tc: tcOf(r) });
@@ -240,15 +240,29 @@ function onlineInfo() {
   const rooms = [], pq = [];
   for (const r of ROOMS.values()) {
     if (r.code || !r.pl.size || (r.pvp && r.ph === 'wait')) continue;
-    rooms.push({ id: r.id, name: r.name, kind: r.pvp ? 'pvp' : r.co ? 'co' : 'gen', map: r.map, ph: r.ph, n: r.pl.size, tc: tcOf(r), rw: r.rw || [0, 0], rn: r.rn | 0, sp: r.sp ? r.sp.size : 0, pl: [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm })) });
+    rooms.push({ id: r.id, name: r.name, kind: r.solo ? 'solo' : r.pvp ? 'pvp' : r.co ? 'co' : 'gen', map: r.map, ph: r.ph, n: r.pl.size, tc: tcOf(r), rw: r.rw || [0, 0], rn: r.rn | 0, sp: r.sp ? r.sp.size : 0, pl: [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm })) });
   }
   for (const n of [1, 2, 3]) { let w = null; for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait') { w = r; break; } pq.push({ n, have: w ? w.pl.size : 0, need: 2 * n, names: w ? [...w.pl.values()].map(o => o.name) : [] }); }
   return { n: presN(), rooms, pq };
+}
+/* solo reporter: a player in an offline mode streams position only, so others can watch from the ONLINE list */
+const SOLOS = new Map();
+function soloJoin(c, m) {
+  if (c.joining) return; c.joining = true;
+  store.sessionUser(sha(String(m.token || ''))).then(u => {
+    if (!u || c.dead || isBanned(u.name)) return wsDrop(c);
+    const oldc = SOLOS.get(u.id); if (oldc && oldc !== c) wsDrop(oldc);
+    const r = newRoom('solo-' + u.id + '-' + Date.now().toString(36), u.name + ' (SOLO)', '');
+    r.priv = true; r.solo = 1; r.ph = 'play'; r.t0 = Date.now(); r.map = String(m.map || 'arena').replace(/[^\w]/g, '').slice(0, 12) || 'arena'; r.mode = String(m.mode || '').replace(/[^\w ]/g, '').slice(0, 16);
+    c.user = u; c.room = r; c.pid = 1; c.tm = 0; c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.pr = 0; c.k = 0; c.d = 0; c.solo = true; r.nextId = 2; r.host = 1; r.hs = Date.now(); r.pl.set(1, c); SOLOS.set(u.id, c);
+    wsOut(c, { t: 'solo', ok: 1 });
+  }).catch(() => wsDrop(c));
 }
 function wsMsg(c, m) {
   if (c.dead || !m || typeof m.t !== 'string') return;
   if (m.t === 'ping') return wsOut(c, { t: 'pong' });
   if (!c.room) {
+    if (m.t === 'solo') return soloJoin(c, m);
     if (m.t !== 'join' || c.joining) return; c.joining = true;
     store.sessionUser(sha(String(m.token || ''))).then(async u => {
       if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
@@ -285,6 +299,7 @@ function wsMsg(c, m) {
     return;
   }
   if (c.spec) return;   /* spectators only watch */
+  if (c.solo && m.t !== 's' && m.t !== 'fx') return;
   const r = c.room, now = Date.now();
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
@@ -356,6 +371,7 @@ function wsMsg(c, m) {
 setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
+    if (r.solo) continue;
     if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
       if (r.ph === 'play' && n - r.t0 >= PVP_RT) { const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1); pvpEnd(r, a0 > a1 ? 0 : a1 > a0 ? 1 : r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1); }
@@ -410,7 +426,8 @@ const server = http.createServer(async (req, res) => {
     if (url === '/' || url === '/api/health') return send(res, 200, { ok: true, game: 'strikezone', storage: process.env.DATABASE_URL ? 'postgres' : 'file', rooms: ROOMS.size, online: USERS.size });
     if (url === '/api/online' && req.method === 'GET') {
       const id = (new URL(req.url, 'http://x').searchParams.get('id') || '').replace(/[^\w-]/g, '').slice(0, 24);
-      if (id && (PRES.has(id) || PRES.size < 5000)) PRES.set(id, Date.now());
+      if (id && new URL(req.url, 'http://x').searchParams.get('bye')) PRES.delete(id);
+      else if (id && (PRES.has(id) || PRES.size < 5000)) PRES.set(id, Date.now());
       return send(res, 200, onlineInfo());
     }
     if (url === '/api/rooms' && req.method === 'GET') {
