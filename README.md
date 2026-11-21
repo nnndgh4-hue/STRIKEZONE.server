@@ -121,3 +121,5 @@ After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest co
 
 After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest commit).
 - Backstab check (PvP): a `hit` message with `bs:<activation id>` is checked against the last positions the server saw for both players (attacker within 4.6 m, in the back half of the victim and looking at them). If it fails, or two backstabs come less than 0.45 s apart, it counts as a plain 50 damage knife hit. The same activation id twice is dropped. Walls are checked by the game on the attacker's side, the server has no map.
+- Stuck vote fix: a client that is still on the vote screen 2.5 s after the timer ended sends `{t:'sync'}` (at most once per 2 s). If the round is overdue the server starts it, and if the round is already running the client gets the current `go`. Every room is also wrapped in try/catch in the 500 ms loop so one bad room cannot stall the others.
+- Ghost players: anyone who sends nothing (not even the 10 second ping) for 90 s is dropped (`GHOST_MS` changes it), so rooms do not fill up with dead connections.

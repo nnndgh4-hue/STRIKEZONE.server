@@ -261,6 +261,7 @@ function soloJoin(c, m) {
 }
 function wsMsg(c, m) {
   if (c.dead || !m || typeof m.t !== 'string') return;
+  c.seen = Date.now();
   if (m.t === 'ping') return wsOut(c, { t: 'pong' });
   if (!c.room) {
     if (m.t === 'solo') return soloJoin(c, m);
@@ -306,6 +307,11 @@ function wsMsg(c, m) {
     if (now - c.ls < 30) return; c.ls = now;
     c.ps = { x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), t: now };
     roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(63, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
+  } else if (m.t === 'sync') {
+    /* a client that is stuck on the vote screen asks where the room is: start the round if it is overdue, or send it the current round */
+    if (now - (c.lsy || 0) < 2000) return; c.lsy = now;
+    if ((r.ph === 'vote' || r.ph === 'break') && now >= r.vend && !r.solo) { try { startRound(r); if (r.pvp) pvpCheck(r); } catch (e) { console.error('sync start', e); } }
+    else if (r.ph === 'play' && !r.solo) wsOut(c, { t: 'go', map: r.map, rn: r.rn | 0, rw: r.rw || [0, 0], sync: 1 });
   } else if (m.t === 'adm') {
     if (!c.admin) return;
     const cm = String(m.c || '');
@@ -389,6 +395,7 @@ function bsCheck(a, v, now, id) {
 setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
+   try {
     if (r.solo) continue;
     if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
@@ -398,8 +405,17 @@ setInterval(() => {
     }
     if (r.ph === 'play' && n - r.t0 >= 603000) endRound(r, r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1);
     else if (r.ph === 'vote' && n >= r.vend) startRound(r);
+   } catch (e) { console.error('room loop', r.id, e); }
   }
 }, 500).unref();
+/* players whose connection died without a goodbye (closed laptop, killed tab) would stay in the room forever: drop them after 90 s of silence (the game pings every 10 s) */
+setInterval(() => {
+  const n = Date.now();
+  for (const r of [...ROOMS.values()]) {
+    if (r.solo) continue;
+    for (const c of [...r.pl.values()]) { if (!c.seen) c.seen = n; if (n - c.seen > (Number(process.env.GHOST_MS) || 90000)) { try { wsDrop(c); } catch (e) { } } }
+  }
+}, 10000).unref();
 /* if the host stops sending bots (hidden window, frozen tab) hand the bots to a player who is still actively playing */
 setInterval(() => {
   const n = Date.now();
