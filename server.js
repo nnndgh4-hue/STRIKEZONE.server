@@ -304,6 +304,7 @@ function wsMsg(c, m) {
   const r = c.room, now = Date.now();
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
+    c.ps = { x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), t: now };
     roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(63, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
   } else if (m.t === 'adm') {
     if (!c.admin) return;
@@ -348,7 +349,9 @@ function wsMsg(c, m) {
     if (now - c.lh < 12) return; c.lh = now; if (r.pvp && r.ph !== 'play') return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
     if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
-    wsOut(v, { t: 'hit', from: c.pid, d, hs: m.hs ? 1 : 0 });
+    let dd = d;
+    if (m.bs && r.pvp) { const k = bsCheck(c, v, now, m.bs | 0); if (k === 0) return; if (k === 2) dd = Math.min(dd, 50); }
+    wsOut(v, { t: 'hit', from: c.pid, d: dd, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'hit2' && r.host === c.pid) {
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
     if (!v || !(d >= 1 && d <= 60)) return;
@@ -368,6 +371,20 @@ function wsMsg(c, m) {
     if (now - c.lb < 60) return; c.lb = now;
     roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0)), num(a[8], 30)] : [0, 0, 0, 0, 0, 2, 0, 0, 0]) }, c);
   }
+}
+/* backstab check: 1 = fine, 2 = not a real backstab (counts as a plain knife hit), 0 = the same activation again */
+function bsCheck(a, v, now, id) {
+  if (id && id === a.bsId && now - (a.bsT || 0) < 2000) return 0;
+  const quick = now - (a.bsT || 0) < 450;
+  a.bsId = id; a.bsT = now;
+  if (quick) return 2;
+  const A = a.ps, V = v.ps;
+  if (!A || !V || now - A.t > 2000 || now - V.t > 2000) return 2;
+  const dx = A.x - V.x, dz = A.z - V.z, d = Math.hypot(dx, dz) || 1;
+  if (d > 4.6 || Math.abs(A.y - V.y) > 2.6) return 2;
+  if ((dx * -Math.sin(V.yw) + dz * -Math.cos(V.yw)) / d > 0.05) return 2;   /* the attacker must be in the back half of the victim */
+  if (((-dx) * -Math.sin(A.yw) + (-dz) * -Math.cos(A.yw)) / d < 0.2) return 2; /* and look at them */
+  return 1;
 }
 setInterval(() => {
   const n = Date.now();

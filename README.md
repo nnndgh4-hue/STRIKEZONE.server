@@ -120,3 +120,4 @@ After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest co
 - **Watching:** a logged-in player can join a live public server or running PvP match as a spectator (`join` with `spec: roomId`). Spectators receive positions and bots but cannot move, shoot, chat, vote or take a slot, and private-code servers and PvP rooms still waiting for players cannot be watched. If the match empties, spectators are sent back to the menu.
 
 After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest commit).
+- Backstab check (PvP): a `hit` message with `bs:<activation id>` is checked against the last positions the server saw for both players (attacker within 4.6 m, in the back half of the victim and looking at them). If it fails, or two backstabs come less than 0.45 s apart, it counts as a plain 50 damage knife hit. The same activation id twice is dropped. Walls are checked by the game on the attacker's side, the server has no map.
