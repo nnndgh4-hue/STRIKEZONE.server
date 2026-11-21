@@ -233,6 +233,7 @@ const swPat = w => [...w].map(ch => (LEET[ch] || ch) + '+').join('[.\\-_*]?');
 const SW_OPEN = ['fuck', 'shit', 'bitch', 'cunt', 'bullshit', 'motherfucker'], SW_WHOLE = ['dick', 'cock', 'pussy', 'whore', 'slut', 'prick', 'twat', 'wank', 'wanker', 'bollocks', 'asshole', 'ass', 'arse', 'bastard', 'nigger', 'nigga', 'fag', 'faggot', 'retard', 'piss', 'damn', 'crap', 'douche', 'jackass', 'dumbass', 'cum', 'tits'];
 const SW_RE = new RegExp('(?<![a-z0-9])(?:' + SW_OPEN.map(w => swPat(w) + '[a-z]*').join('|') + '|(?:' + SW_WHOLE.map(swPat).join('|') + ')(?:s|es|ed|ing|er|ers|y)?)(?![a-z0-9])', 'gi');
 const cleanChat = tx => tx.replace(SW_RE, m => '#'.repeat(m.length));
+const GCHAT = [], GC_LAST = new Map(); let gcSeq = 0;   /* global chat (see /api/gchat) */
 /* ---------- presence: everybody who has the game open (even on the home page) ---------- */
 const PRES = new Map();
 function presN() { const t = Date.now(); for (const [k, v] of PRES) if (t - v > 50000) PRES.delete(k); return PRES.size; }
@@ -429,6 +430,26 @@ const server = http.createServer(async (req, res) => {
       if (id && new URL(req.url, 'http://x').searchParams.get('bye')) PRES.delete(id);
       else if (id && (PRES.has(id) || PRES.size < 5000)) PRES.set(id, Date.now());
       return send(res, 200, onlineInfo());
+    }
+    /* global chat: one shared room for everybody, in a match or on the home page. Anyone can read it; you need to be logged in to write. The last 100 messages are kept in memory only. */
+    if (url === '/api/gchat' && req.method === 'GET') {
+      let since = Math.max(0, Number(new URL(req.url, 'http://x').searchParams.get('since')) | 0); if (since > gcSeq) since = 0;   /* the server restarted: start again */
+      const list = since ? GCHAT.filter(m => m.id > since).slice(-50) : GCHAT.slice(-30);
+      return send(res, 200, { msgs: list, last: gcSeq });
+    }
+    if (url === '/api/gchat' && req.method === 'POST') {
+      const u = await auth(req); if (!u) return send(res, 401, { error: 'Log in to use global chat.' });
+      if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG, banned: true });
+      const b = await body(req), t = Date.now(), k = String(u.name).toLowerCase();
+      const tx = cleanChat(String(b.m || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120));
+      if (!tx) return send(res, 400, { error: 'Type something first.' });
+      const last = GC_LAST.get(k) || { t: 0, m: '' };
+      if (t - last.t < 1500) return send(res, 429, { error: 'Slow down a little.' });
+      if (last.m === tx && t - last.t < 15000) return send(res, 429, { error: 'You just said that.' });
+      GC_LAST.set(k, { t, m: tx }); if (GC_LAST.size > 5000) GC_LAST.delete(GC_LAST.keys().next().value);
+      const m = { id: ++gcSeq, n: u.name, m: tx, ts: t, a: isAdmin(u.name) ? 1 : 0 };
+      GCHAT.push(m); while (GCHAT.length > 100) GCHAT.shift();
+      return send(res, 200, { ok: true, id: m.id });
     }
     if (url === '/api/rooms' && req.method === 'GET') {
       const now = Date.now(), list = [...ROOMS.values()].filter(r => !r.priv).map(r => ({ id: r.id, name: r.name, n: r.pl.size, tc: tcOf(r), el: now - r.t0, sc: r.sc, ph: r.ph, map: r.map }));
