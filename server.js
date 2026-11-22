@@ -352,7 +352,9 @@ function wsMsg(c, m) {
     if (!tx || now - (c.lc || 0) < 700) return; c.lc = now;
     roomOut(r, { t: 'c', i: c.pid, n: c.name, tm: c.tm, m: tx });
   } else if (m.t === 'hit') {
-    if (now - c.lh < 12) return; c.lh = now; if (r.pvp && r.ph !== 'play') return;
+    /* hits are spaced 12 ms apart, except that one shotgun volley (up to 10 pellets) arrives at once and every pellet counts */
+    if (now - c.lh < 12) { if ((c.lb = (c.lb || 0) + 1) > 10) return; } else { c.lh = now; c.lb = 1; }
+    if (r.pvp && r.ph !== 'play') return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
     if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
     let dd = d;
