@@ -133,7 +133,14 @@ async function resetUser(name) {
   await store.delSave(u.id); await store.lbDel(u.id); await store.kvSet('rst:' + u.name.toLowerCase(), String(Date.now())); lbCache = null; return u;
 }
 const titleOf = n => { const t = TITLES.get(String(n || '').toLowerCase()); return t ? [t.t, t.c] : null; };   // lowercase username -> { n, t, c }
+/* roles: read live from the name tag beside a player's name, so a tag added later counts straight away. admin > developer > tester. Capital letters do not matter. */
+const roleOf = n => { if (isAdmin(n)) return 'admin'; const t = TITLES.get(String(n || '').toLowerCase()), x = t ? String(t.t || '') : ''; return /\bdeveloper\b/i.test(x) ? 'dev' : /\btester\b/i.test(x) ? 'tester' : ''; };
+/* commands. Testers and developers can use the base five on ANY server; the extra sets only inside the TEST server. Everything else is for the admin account only. */
+const AC_BASE = ['god', 'killred', 'heal', 'ammo', 'freeze'];
+const AC_TEST = { tester: ['superspeed', 'supergravity', 'infammo'], dev: ['taco', 'minigun', 'infammo', 'supergravity', 'superspeed', 'enlarge', 'dropgun', 'boss'] };
+const acAllowed = (role, cmd, inTest) => role === 'admin' || (AC_BASE.includes(cmd) && (role === 'tester' || role === 'dev')) || (inTest && !!AC_TEST[role] && AC_TEST[role].includes(cmd));
 const HEX = /^#[0-9a-fA-F]{6}$/;
+function rolePush(t) { const c = USERS.get(t.id); if (!c || c.dead) return; c.role = roleOf(t.name); wsOut(c, { t: 'role', role: c.role }); if (c.room && c.room.test && !c.role) { wsOut(c, { t: 'err', m: 'The test server is only for testers and developers.', soft: 1 }); setTimeout(() => wsDrop(c), 300); } }
 let lbCache = null, lbCacheAt = 0;
 
 function plausible(save, prev, now) {
@@ -155,6 +162,7 @@ const roomOut = (r, o, skip) => { const f = wsFrame(JSON.stringify(o)); for (con
 const CODES = new Map();   // private code -> room
 function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'arena', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
+function testRoom() { let r = ROOMS.get('test-room'); if (!r) { r = newRoom('test-room', 'TEST SERVER', ''); r.priv = true; r.test = 1; r.ph = 'play'; r.vend = Infinity; r.evs = {}; } return r; }
 function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)]; if (!CODES.has(c)) return c; } return null; }
 function findRoom(team) {
   let best = null; for (const r of ROOMS.values()) if (!r.priv && r.pl.size < MAXP && tcOf(r)[team] < MAXT && (!best || r.pl.size > best.pl.size)) best = r;
@@ -167,7 +175,7 @@ const vcount = r => { const v = {}; mapsOf(r).forEach(k => { v[k] = 0; }); for (
 function endRound(r, win) {
   if (r.ph !== 'play') return;
   roomOut(r, { t: 'end', win, sc: r.sc, lb: lbOf(r), rs: RES_MS, vl: RES_MS + VOTE_MS });
-  r.ph = 'vote'; r.vend = Date.now() + RES_MS + VOTE_MS; r.votes.clear();
+  r.ph = 'vote'; r.vend = Date.now() + RES_MS + VOTE_MS; r.votes.clear(); r.evs = {}; for (const o of r.pl.values()) { o.god = 0; o.os = 0; }
 }
 function startRound(r) {
   const v = vcount(r), ml = mapsOf(r), top = Math.max(...ml.map(k => v[k]));
@@ -177,7 +185,7 @@ function startRound(r) {
   if (r.co) r.cw = 0;
   roomOut(r, { t: 'go', map: r.map, rn: r.rn | 0, rw: r.rw || [0, 0] });
 }
-function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; for (const o of r.pl.values()) { if (!r.pvp) { o.k = 0; o.d = 0; } o.pa = true; } }
+function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; r.evs = {}; for (const o of r.pl.values()) { o.god = 0; o.os = 0; } for (const o of r.pl.values()) { if (!r.pvp) { o.k = 0; o.d = 0; } o.pa = true; } }
 /* ---------- PvP queues: 1v1 / 2v2 / 3v3, no bots, one life per round, first to 3 round wins ---------- */
 const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.env.PVP_BREAK) || 10000, PVP_WINS = 3, PVP_MAXR = 9;
 let pvpN = 0;
@@ -240,11 +248,11 @@ function presN() { const t = Date.now(); for (const [k, v] of PRES) if (t - v > 
 function onlineInfo() {
   const rooms = [], pq = [];
   for (const r of ROOMS.values()) {
-    if (r.code || !r.pl.size || (r.pvp && r.ph === 'wait')) continue;
+    if (r.code || r.test || !r.pl.size || (r.pvp && r.ph === 'wait')) continue;
     rooms.push({ id: r.id, name: r.name, kind: r.solo ? 'solo' : r.pvp ? 'pvp' : r.co ? 'co' : 'gen', map: r.map, ph: r.ph, n: r.pl.size, tc: tcOf(r), rw: r.rw || [0, 0], rn: r.rn | 0, sp: r.sp ? r.sp.size : 0, pl: [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm })) });
   }
   for (const n of [1, 2, 3]) { let w = null; for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait') { w = r; break; } pq.push({ n, have: w ? w.pl.size : 0, need: 2 * n, names: w ? [...w.pl.values()].map(o => o.name) : [] }); }
-  return { n: presN(), rooms, pq };
+  const tr = ROOMS.get('test-room'); return { n: presN(), rooms, pq, test: tr ? tr.pl.size : 0 };
 }
 /* solo reporter: a player in an offline mode streams position only, so others can watch from the ONLINE list */
 const SOLOS = new Map();
@@ -275,13 +283,14 @@ function wsMsg(c, m) {
       const team = m.team === 1 ? 1 : 0;
       if (m.spec) {
         const sr = ROOMS.get(String(m.spec).slice(0, 40));
-        if (!sr || sr.code || (sr.pvp && sr.ph === 'wait')) return soft('That match is not available to watch.');
+        if (!sr || sr.code || sr.test || (sr.pvp && sr.ph === 'wait')) return soft('That match is not available to watch.');
         c.user = u; c.room = sr; c.spec = true; c.pid = -1; c.name = u.name; c.tm = 0; (sr.sp = sr.sp || new Set()).add(c);
         const sl = [...sr.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
         return wsOut(c, { t: 'w', id: -1, spec: 1, room: sr.id, name: sr.name, priv: 0, code: '', co: sr.co ? 1 : 0, cw: sr.cw | 0, host: sr.host, tm: 0, pl: sl, tc: tcOf(sr), el: Date.now() - sr.t0, sc: sr.sc, lb: lbOf(sr), map: sr.map, ph: sr.ph, vl: Math.max(0, sr.vend - Date.now()), vt: vcount(sr), pvp: sr.pvp | 0, need: sr.pvp ? 2 * sr.pvp : 0, rw: sr.rw || [0, 0], rn: sr.rn | 0 });
       }
       let r = null;
-      if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
+      if (m.test) { if (!roleOf(u.name)) return soft('The test server is only for testers and developers.'); r = testRoom(); }
+      else if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
       else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
       else if (m.co) r = coRoom();
@@ -290,11 +299,12 @@ function wsMsg(c, m) {
       if (r.pl.size >= (r.co ? COMAX : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.pr = pr; c.k = 0; c.d = 0;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.role = roleOf(u.name); c.pr = pr; c.k = 0; c.d = 0;
       if (!r.host) { r.host = pid; r.hs = Date.now(); }
       const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0 });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0, role: c.role, test: r.test ? 1 : 0 });
+      if (r.evs && Object.keys(r.evs).length) wsOut(c, { t: 'acs', evs: r.evs });
       roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0 } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
       if (r.pvp && r.ph === 'wait') { pvpQ(r); if (r.pl.size >= 2 * r.pvp) pvpFull(r); }
     }).catch(() => wsDrop(c));
@@ -313,11 +323,32 @@ function wsMsg(c, m) {
     if ((r.ph === 'vote' || r.ph === 'break') && now >= r.vend && !r.solo) { try { startRound(r); if (r.pvp) pvpCheck(r); } catch (e) { console.error('sync start', e); } }
     else if (r.ph === 'play' && !r.solo) wsOut(c, { t: 'go', map: r.map, rn: r.rn | 0, rw: r.rw || [0, 0], sync: 1 });
   } else if (m.t === 'adm') {
-    if (!c.admin) return;
-    const cm = String(m.c || '');
+    const cm = String(m.c || ''); c.role = roleOf(c.name); c.admin = c.role === 'admin';
+    if (!c.admin && !(['freeze', 'killred'].includes(cm) && (c.role === 'tester' || c.role === 'dev'))) return;
     if (cm === 'time') { r.t0 = Math.min(Date.now() - 1000, r.t0 - 60000); if (Date.now() - r.t0 > 570000) r.t0 = Date.now() - 570000; roomOut(r, { t: 'clk', el: Date.now() - r.t0 }); return; }
     if (!['freeze', 'killred', 'auto', 'follow', 'hold', 'attack', 'defend', 'spread'].includes(cm) || r.host === c.pid) return;
     const h = r.pl.get(r.host); if (h) wsOut(h, { t: 'adm', c: cm, tm: c.tm, from: c.pid });
+  } else if (m.t === 'ac') {
+    /* room-scoped command. The server checks the sender's role from their name tag every time. */
+    const cm = String(m.c || '').replace(/[^\w]/g, '').slice(0, 20); c.role = roleOf(c.name); c.admin = c.role === 'admin';
+    if (!cm || !acAllowed(c.role, cm, !!r.test) || r.solo) return;
+    if (now - (c.lac || 0) < 150) return; c.lac = now;
+    const a = (m.a && typeof m.a === 'object') ? JSON.parse(JSON.stringify(m.a)) : {}; if (JSON.stringify(a).length > 600) return;
+    if (m.to !== undefined) { if (!c.admin) return; }
+    const tg = Array.isArray(m.to) ? m.to.slice(0, 24).map(x => x | 0) : (m.to === 'all' ? 'all' : null);
+    const tl = tg === 'all' ? [...r.pl.values()] : (tg || []).map(x => r.pl.get(x)).filter(Boolean);
+    if (c.admin) {
+      /* server-side effects that must not be fakeable by the victim's client */
+      if (cm === 'godon' || cm === 'inf') for (const o of tl) { o.god = 1; }
+      if (cm === 'godoff') for (const o of tl) { o.god = 0; }
+      if (cm === 'oneshot') for (const o of tl) o.os = a.on === false ? 0 : 1;
+      if (cm === 'oneshotall' && a.on === false) for (const o of r.pl.values()) o.os = 0;
+      if (cm === 'stopall') { r.evs = {}; for (const o of r.pl.values()) { o.god = 0; o.os = 0; } }
+      else if (r.evs && a.round && a.on !== false) r.evs[cm] = { a, by: c.pid };
+      else if (r.evs && a.on === false) delete r.evs[cm];
+      if (cm === 'oneshotall' && a.on !== false) for (const o of r.pl.values()) o.os = 1;
+    }
+    roomOut(r, { t: 'ac', i: c.pid, c: cm, a, to: tg });
   } else if (m.t === 'pd') {
     if (r.co) { if (r.ph !== 'play') return; c.pa = false; coCheck(r); return; }
     if (!r.pvp || r.ph !== 'play') return; c.pa = false; pvpCheck(r);
@@ -356,9 +387,12 @@ function wsMsg(c, m) {
     if (now - c.lh < 12) { if ((c.lb = (c.lb || 0) + 1) > 10) return; } else { c.lh = now; c.lb = 1; }
     if (r.pvp && r.ph !== 'play') return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
-    if (!v || v === c || v.tm === c.tm || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
+    if (!v || v === c || (v.tm === c.tm && !r.test) || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
     let dd = d;
     if (m.bs && r.pvp) { const k = bsCheck(c, v, now, m.bs | 0); if (k === 0) return; if (k === 2) dd = Math.min(dd, 50); }
+    if (v.god) return;
+    if (r.evs && r.evs.hsonly && !m.hs) return;
+    if (c.os) dd = 1000;
     wsOut(v, { t: 'hit', from: c.pid, d: dd, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'hit2' && r.host === c.pid) {
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
@@ -398,7 +432,7 @@ setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
    try {
-    if (r.solo) continue;
+    if (r.solo || r.test) continue;
     if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
       if (r.ph === 'play' && n - r.t0 >= PVP_RT) { const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1); pvpEnd(r, a0 > a1 ? 0 : a1 > a0 ? 1 : r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1); }
@@ -498,7 +532,7 @@ const server = http.createServer(async (req, res) => {
       if (pw.length < 8 || pw.length > 100) return send(res, 400, { error: 'Password must be 8 to 100 characters.' });
       const salt = crypto.randomBytes(16).toString('hex'), id = await store.createUser(name, salt, await scrypt(pw, salt));
       if (!id) return send(res, 409, { error: 'That username is taken.' });
-      return send(res, 200, { token: await startSession({ id }), user: name, admin: isAdmin(name) });
+      return send(res, 200, { token: await startSession({ id }), user: name, admin: isAdmin(name), role: roleOf(name) });
     }
     if (url === '/api/login' && req.method === 'POST') {
       if (limited(ip)) return send(res, 429, { error: 'Too many attempts. Try again in a few minutes.' });
@@ -506,8 +540,9 @@ const server = http.createServer(async (req, res) => {
       const ok = u && crypto.timingSafeEqual(Buffer.from(await scrypt(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
       if (!ok) return send(res, 401, { error: 'Wrong username or password.' });
       if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG, banned: true });
-      return send(res, 200, { token: await startSession(u), user: u.name, admin: isAdmin(u.name) });
+      return send(res, 200, { token: await startSession(u), user: u.name, admin: isAdmin(u.name), role: roleOf(u.name) });
     }
+    if (url === '/api/me' && req.method === 'GET') { const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' }); return send(res, 200, { user: u.name, admin: isAdmin(u.name), role: roleOf(u.name) }); }
     if (url === '/api/logout' && req.method === 'POST') { const h = req.headers.authorization || ''; if (h.startsWith('Bearer ')) await store.delSession(sha(h.slice(7))); return send(res, 200, { ok: true }); }
     if (url === '/api/event' && req.method === 'POST') {
       const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
@@ -555,9 +590,9 @@ const server = http.createServer(async (req, res) => {
       if (!NAME.test(un)) return send(res, 400, { error: 'Type the exact username of the player.' });
       const target = await store.userByName(un.toLowerCase()); if (!target) return send(res, 404, { error: 'No player has that username.' });
       const txt = String(b.text || '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 16);
-      if (!txt) { await store.titleDel(un.toLowerCase()); TITLES.delete(un.toLowerCase()); return send(res, 200, { ok: true, removed: true }); }
+      if (!txt) { await store.titleDel(un.toLowerCase()); TITLES.delete(un.toLowerCase()); rolePush(target); return send(res, 200, { ok: true, removed: true }); }
       const col = HEX.test(String(b.color || '')) ? String(b.color).toLowerCase() : '#ffd400';
-      await store.titleSet(un.toLowerCase(), target.name, txt, col); TITLES.set(un.toLowerCase(), { n: target.name, t: txt, c: col });
+      await store.titleSet(un.toLowerCase(), target.name, txt, col); TITLES.set(un.toLowerCase(), { n: target.name, t: txt, c: col }); rolePush(target);
       return send(res, 200, { ok: true, user: target.name, text: txt, color: col });
     }
     /* admin coin gifts: the admin gives coins to a username, they wait in the database until that player's game claims them */
@@ -602,6 +637,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+      if (req.method === 'PUT') { const cc = USERS.get(u.id); if (cc && cc.room && cc.room.test) return send(res, 200, { ok: true, upd: Date.now(), test: 1 }); }   /* nothing played in the test server is ever saved */
       if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG, banned: true });
       const rst = await store.kvGet('rst:' + u.name.toLowerCase());
       if (req.method === 'GET') { const s = await store.getSave(u.id); return send(res, 200, { user: u.name, admin: isAdmin(u.name), save: s ? JSON.parse(s.data) : null, upd: s ? s.upd : 0, rst: rst || '' }); }
