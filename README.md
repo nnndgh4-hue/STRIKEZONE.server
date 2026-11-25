@@ -135,3 +135,5 @@ After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest co
 ## V107: event timer effects
 
 `POST /api/live` (admin) now accepts an optional `fx` (`'next'` = the thin animated next-update strip). Anything else is stored as an empty string. `GET /api/live` returns it with the event, so every home screen can draw the effect.
+
+`fx` on `/api/live` is now a comma list, any mix of `next` (next-update strip) and `trailer` (watch-the-trailer button); anything else is dropped.
