@@ -567,7 +567,8 @@ const server = http.createServer(async (req, res) => {
       if (!nm) return send(res, 400, { error: 'Type a name for the event.' });
       const ms = Math.round(Number(b.ms));
       if (!(ms >= 0) || ms > 366 * 864e5) return send(res, 400, { error: 'The timer must be between 0 and 366 days.' });
-      LIVE = { n: nm, end: Date.now() + ms, set: Date.now() };
+      const fx = ['next'].includes(String(b.fx || '')) ? String(b.fx) : '';   /* optional look for the timer; 'next' = the thin next-update strip */
+      LIVE = { n: nm, end: Date.now() + ms, set: Date.now(), fx };
       await store.kvSet('live', JSON.stringify(LIVE));
       return send(res, 200, { ok: true, now: Date.now(), ev: LIVE });
     }

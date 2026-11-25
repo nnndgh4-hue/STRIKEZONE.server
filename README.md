@@ -131,3 +131,7 @@ After updating `server.js`, redeploy on Render (Manual Deploy > Deploy latest co
 - **Test server**: `join` with `test:1` is refused unless the account has a role. One room `test-room`, always in play, no round end, hidden from `/api/online` rooms and `/api/rooms`, not watchable; `/api/online` only reports `test: <players>`. `PUT /api/save` from a player inside it is accepted but ignored, so nothing earned there reaches the save or the leaderboard.
 - **Commands** (`{t:'ac', c, a, to}`) are checked on the server against the sender's role every time. Testers and developers: `god, killred, heal, ammo, freeze` on any server. Test server extras: tester `superspeed, supergravity, infammo`; developer `taco, minigun, infammo, supergravity, superspeed, enlarge, dropgun, boss`. Everything else, and every `to` target list, is admin only. `adm` (freeze / kill red) is open to testers and developers, the other orders stay admin only.
 - Commands only travel inside the room. God mode and one-shot kills are enforced here on `hit`; per-round effects are cleared when a round starts or ends and sent to late joiners (`acs`).
+
+## V107: event timer effects
+
+`POST /api/live` (admin) now accepts an optional `fx` (`'next'` = the thin animated next-update strip). Anything else is stored as an empty string. `GET /api/live` returns it with the event, so every home screen can draw the effect.
