@@ -320,7 +320,7 @@ function wsMsg(c, m) {
   if (m.t === 's') {
     if (now - c.ls < 30) return; c.ls = now;
     c.ps = { x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), t: now };
-    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(63, m.w | 0)), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
+    roomOut(r, { t: 's', i: c.pid, x: num(m.x, 200), y: num(m.y, 100), z: num(m.z, 200), yw: num(m.yw, 20), pt: num(m.pt, 4), a: m.a ? 1 : 0, c: m.c ? 1 : 0, v: num(m.v, 30), w: Math.max(0, Math.min(63, m.w | 0)), h: num(m.h, 1000), k: typeof m.k === 'string' ? m.k.replace(/[^\w-]/g, '').slice(0, 24) : '', sl: m.sl ? 1 : 0 }, c);
   } else if (m.t === 'sync') {
     /* a client that is stuck on the vote screen asks where the room is: start the round if it is overdue, or send it the current round */
     if (now - (c.lsy || 0) < 2000) return; c.lsy = now;
