@@ -313,10 +313,16 @@ async function clanApi(url, req, res) {
   if (url === '/api/clan/board') {
     if (req.method === 'GET') { let o = null; try { o = JSON.parse(await store.kvGet('cb:' + cl.id) || 'null'); } catch (e) { } return send(res, 200, { s: o ? o.s : [], at: o ? o.at : 0, by: o && o.by ? o.by : '' }); }
     if (req.method === 'POST') {
-      const s = Array.isArray(b.s) ? b.s.slice(0, 400) : null; if (!s) return err('Bad board.');
-      const out = []; let pts = 0;
-      for (const k of s) { if (!k || typeof k !== 'object' || !Array.isArray(k.p)) continue; const col = k.c === 'e' ? 'e' : /^#[0-9a-fA-F]{6}$/.test(k.c) ? k.c : '#ffffff', w = Math.max(1, Math.min(40, k.w | 0 || 3)), p = k.p.slice(0, 3000).map(n => Math.max(0, Math.min(1000, Math.round(Number(n) || 0)))); pts += p.length; if (pts > 40000) break; out.push({ c: col, w, p }); }
-      const o = { s: out, at: Date.now(), by: u.name }; await store.kvSet('cb:' + cl.id, JSON.stringify(o)); return send(res, 200, { ok: true, at: o.at });
+      /* the board is shared: every save is merged into what is already there, so nobody wipes anybody else's writing */
+      let o = null; try { o = JSON.parse(await store.kvGet('cb:' + cl.id) || 'null'); } catch (e) { }
+      let cur = o && Array.isArray(o.s) ? o.s : [];
+      if (b.clear === 1) cur = [];
+      else if (b.undo === 1) { for (let i = cur.length - 1; i >= 0; i--) if (cur[i].a === u.name) { cur.splice(i, 1); break; } }
+      else if (Array.isArray(b.add)) {
+        for (const k of b.add.slice(0, 20)) { if (!k || typeof k !== 'object' || !Array.isArray(k.p)) continue; const col = k.c === 'e' ? 'e' : /^#[0-9a-fA-F]{6}$/.test(k.c) ? k.c : '#ffffff', w = Math.max(1, Math.min(40, k.w | 0 || 3)), p = k.p.slice(0, 3000).map(n => Math.max(0, Math.min(1000, Math.round(Number(n) || 0)))); cur.push({ c: col, w, p, a: u.name }); }
+        let pts = 0; for (let i = cur.length - 1; i >= 0; i--) { pts += cur[i].p.length; if (pts > 60000 || cur.length - i > 500) { cur = cur.slice(i + 1); break; } }
+      } else return err('Bad board.');
+      o = { s: cur, at: Date.now(), by: u.name }; await store.kvSet('cb:' + cl.id, JSON.stringify(o)); return send(res, 200, { ok: true, at: o.at, s: cur, by: u.name });
     }
   }
   if (url === '/api/clan/delete' && req.method === 'POST') { if (role !== 'L') return err('Only the leader can delete the clan.', 403); if (b.sure !== 1) return err('Please confirm.'); clDrop(cl); return send(res, 200, { ok: true }); }
