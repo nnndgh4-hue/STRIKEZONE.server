@@ -163,6 +163,9 @@ const CODES = new Map();   // private code -> room
 function newRoom(id, name, code) { const r = { id, name, code: code || '', priv: !!code, pl: new Map(), host: 0, nextId: 1, t0: Date.now(), sc: [0, 0], map: 'arena', ph: 'vote', vend: Date.now() + VOTE_MS, votes: new Map() }; ROOMS.set(id, r); if (code) CODES.set(code, r); return r; }
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
 function testRoom() { let r = ROOMS.get('test-room'); if (!r) { r = newRoom('test-room', 'TEST SERVER', ''); r.priv = true; r.test = 1; r.ph = 'play'; r.vend = Infinity; r.evs = {}; } return r; }
+/* Update 9: the capture the flag room. 12 vs 12 on the RIVERCROSS map, flags and score are run by the host's game and only relayed here. Staff only unless CTF_PUBLIC=1 is set on Render. */
+function ctfRoom() { let r = ROOMS.get('ctf-room'); if (!r) { r = newRoom('ctf-room', 'CAPTURE THE FLAG', ''); r.priv = true; r.ctf = 1; r.map = 'ctf'; r.ph = 'play'; r.vend = Infinity; r.cs = null; } return r; }
+const CTF_MAXT = 12, CTF_MAXP = 24;
 function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += A[crypto.randomInt(A.length)]; if (!CODES.has(c)) return c; } return null; }
 function findRoom(team) {
   let best = null; for (const r of ROOMS.values()) if (!r.priv && r.pl.size < MAXP && tcOf(r)[team] < MAXT && (!best || r.pl.size > best.pl.size)) best = r;
@@ -277,7 +280,7 @@ function wsMsg(c, m) {
     store.sessionUser(sha(String(m.token || ''))).then(async u => {
       if (!u || c.dead) { wsOut(c, { t: 'err', m: 'Please log in again.' }); return wsDrop(c); }
       if (isBanned(u.name)) { wsOut(c, { t: 'err', m: BANNED_MSG }); return wsDrop(c); }
-      let pr = 0; try { const sv = await store.getSave(u.id); if (sv && sv.data) pr = Math.max(0, Math.min(10, Math.floor((Number(JSON.parse(sv.data).lvl) || 1) / 100))); } catch (e) { }
+      let pr = 0, fx = ''; try { const sv = await store.getSave(u.id); if (sv && sv.data) { const d0 = JSON.parse(sv.data); pr = Math.max(0, Math.min(10, Math.floor((Number(d0.lvl) || 1) / 100))); fx = String((d0.eq && d0.eq.tfx) || '').replace(/[^a-z0-9]/g, '').slice(0, 12); } } catch (e) { }
       const adm = isAdmin(u.name), old = USERS.get(u.id);
       const soft = txt => { wsOut(c, { t: 'err', m: txt, soft: 1 }); setTimeout(() => wsDrop(c), 300); };
       const team = m.team === 1 ? 1 : 0;
@@ -285,27 +288,28 @@ function wsMsg(c, m) {
         const sr = ROOMS.get(String(m.spec).slice(0, 40));
         if (!sr || sr.code || sr.test || (sr.pvp && sr.ph === 'wait')) return soft('That match is not available to watch.');
         c.user = u; c.room = sr; c.spec = true; c.pid = -1; c.name = u.name; c.tm = 0; (sr.sp = sr.sp || new Set()).add(c);
-        const sl = [...sr.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
+        const sl = [...sr.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0, fx: o.fx || '' }));
         return wsOut(c, { t: 'w', id: -1, spec: 1, room: sr.id, name: sr.name, priv: 0, code: '', co: sr.co ? 1 : 0, cw: sr.cw | 0, host: sr.host, tm: 0, pl: sl, tc: tcOf(sr), el: Date.now() - sr.t0, sc: sr.sc, lb: lbOf(sr), map: sr.map, ph: sr.ph, vl: Math.max(0, sr.vend - Date.now()), vt: vcount(sr), pvp: sr.pvp | 0, need: sr.pvp ? 2 * sr.pvp : 0, rw: sr.rw || [0, 0], rn: sr.rn | 0 });
       }
       let r = null;
-      if (m.test) { if (!roleOf(u.name)) return soft('The test server is only for testers and developers.'); r = testRoom(); }
+      if (m.ctf) { if (!roleOf(u.name) && process.env.CTF_PUBLIC !== '1') return soft('Capture the flag is only open to testers and developers for now.'); r = ctfRoom(); }
+      else if (m.test) { if (!roleOf(u.name)) return soft('The test server is only for testers and developers.'); r = testRoom(); }
       else if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
       else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
       else if (m.co) r = coRoom();
       else if (m.pvp) { const pn = m.pvp | 0; if (![1, 2, 3].includes(pn)) return soft('Pick 1v1, 2v2 or 3v3.'); r = pvpRoom(pn); }
       else r = findRoom(team);
-      if (r.pl.size >= (r.co ? COMAX : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
+      if (r.pl.size >= (r.co ? COMAX : r.ctf ? CTF_MAXP : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < MAXT ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.role = roleOf(u.name); c.pr = pr; c.k = 0; c.d = 0;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = r.co ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < (r.ctf ? CTF_MAXT : MAXT) ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.role = roleOf(u.name); c.pr = pr; c.fx = fx; c.k = 0; c.d = 0;
       if (!r.host) { r.host = pid; r.hs = Date.now(); }
-      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0 }));
+      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0, fx: o.fx || '' }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0, role: c.role, test: r.test ? 1 : 0 });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0, role: c.role, test: r.test ? 1 : 0, ctf: r.ctf ? 1 : 0, cs: r.cs || null });
       if (r.evs && Object.keys(r.evs).length) wsOut(c, { t: 'acs', evs: r.evs });
-      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0 } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
+      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0, fx: c.fx || '' } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
       if (r.pvp && r.ph === 'wait') { pvpQ(r); if (r.pl.size >= 2 * r.pvp) pvpFull(r); }
     }).catch(() => wsDrop(c));
     return;
@@ -394,13 +398,18 @@ function wsMsg(c, m) {
     if (r.evs && r.evs.hsonly && !m.hs) return;
     if (c.os) dd = 1000;
     wsOut(v, { t: 'hit', from: c.pid, d: dd, hs: m.hs ? 1 : 0 });
+  } else if (m.t === 'ctf' && r.ctf && m.a === 'st' && r.host === c.pid && m.s && typeof m.s === 'object') {
+    /* the host's game says where the flags and the score are. Everybody else just shows it. */
+    if (now - (c.lctf || 0) < 150) return; c.lctf = now;
+    const sn = JSON.stringify(m.s); if (sn.length > 1500) return;
+    r.cs = JSON.parse(sn); roomOut(r, { t: 'ctf', a: 'st', s: r.cs }, c);
   } else if (m.t === 'hit2' && r.host === c.pid) {
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
     if (!v || !(d >= 1 && d <= 60)) return;
     wsOut(v, { t: 'hit', from: -1, d, bn: String(m.bn || 'BOT').slice(0, 30) });
   } else if (m.t === 'bh' && r.host !== c.pid) {
     const h = r.pl.get(r.host), d = Math.round(Number(m.d)), i = m.i | 0;
-    if (!h || i < 0 || i > 19 || !(d >= 1 && d <= 1000)) return;
+    if (!h || i < 0 || i > (r.ctf ? 23 : 19) || !(d >= 1 && d <= 1000)) return;
     wsOut(h, { t: 'bh', from: c.pid, i, d, hs: m.hs ? 1 : 0 });
   } else if (m.t === 'kl') {
     if (r.ph !== 'play') return;
@@ -408,10 +417,10 @@ function wsMsg(c, m) {
     r.sc[kt]++;
     const kc = r.pl.get(m.kp | 0); if (kc && kc.tm === kt) kc.k++; if (m.vp) c.d++;
     roomOut(r, { t: 'kl', src: c.pid, kp: (m.kp | 0), kt, kn: String(m.kn || '').slice(0, 30), vn: String(m.vn || '').slice(0, 30), hs: m.hs ? 1 : 0, vp: m.vp ? 1 : 0, sc: r.sc, lb: lbOf(r) });
-    if (!r.pvp && r.sc[kt] >= 50) endRound(r, kt);
+    if (!r.pvp && !r.ctf && r.sc[kt] >= 50) endRound(r, kt);
   } else if (m.t === 'b' && r.host === c.pid && Array.isArray(m.d)) {
     if (now - c.lb < 60) return; c.lb = now;
-    roomOut(r, { t: 'b', d: m.d.slice(0, 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0)), num(a[8], 30)] : [0, 0, 0, 0, 0, 2, 0, 0, 0]) }, c);
+    roomOut(r, { t: 'b', d: m.d.slice(0, r.ctf ? 24 : 20).map(a => Array.isArray(a) ? [num(a[0], 200), num(a[1], 200), num(a[2], 20), num(a[3], 1e5), num(a[4], 2), a[5] | 0, Math.max(0, Math.min(6000, a[6] | 0)), Math.max(0, Math.min(300, a[7] | 0)), num(a[8], 30)] : [0, 0, 0, 0, 0, 2, 0, 0, 0]) }, c);
   }
 }
 /* backstab check: 1 = fine, 2 = not a real backstab (counts as a plain knife hit), 0 = the same activation again */
@@ -432,7 +441,7 @@ setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
    try {
-    if (r.solo || r.test) continue;
+    if (r.solo || r.test || r.ctf) continue;
     if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
       if (r.ph === 'play' && n - r.t0 >= PVP_RT) { const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1); pvpEnd(r, a0 > a1 ? 0 : a1 > a0 ? 1 : r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1); }
@@ -635,6 +644,33 @@ const server = http.createServer(async (req, res) => {
       await store.kvDel(k);
       try { const prev = await store.getSave(u.id); if (prev) { const d = JSON.parse(prev.data); d.coins = Math.min(5e7, Math.round((d.coins || 0) + n)); await store.putSave(u.id, JSON.stringify(d), prev.upd, prev.at); } } catch (e) { console.error('gift', e.message); }
       return send(res, 200, { n });
+    }
+    /* V110: admin item gifts (skins, weapons, name tag effects). They wait in the database until that player's game picks them up and confirms. */
+    if (url === '/api/giftx' && req.method === 'POST') {
+      const u = await auth(req); if (!u || !isAdmin(u.name)) return send(res, 403, { error: 'Admins only.' });
+      const b = await body(req), un = String(b.user || '').trim(), k = String(b.k || ''), id = String(b.id == null ? '' : b.id);
+      if (!NAME.test(un)) return send(res, 400, { error: 'Type the exact username of the player.' });
+      if (!(k === 'sk' || k === 'wp' || k === 'tx') || !/^[A-Za-z0-9_]{1,40}$/.test(id)) return send(res, 400, { error: 'That item is not valid.' });
+      const target = await store.userByName(un.toLowerCase()); if (!target) return send(res, 404, { error: 'No player has that username.' });
+      const key = 'gx:' + target.name.toLowerCase(); let list = []; try { list = JSON.parse(await store.kvGet(key) || '[]'); } catch (e) { list = []; }
+      if (!Array.isArray(list)) list = [];
+      if (list.length >= 200) return send(res, 400, { error: 'That player has too many gifts waiting.' });
+      list.push({ i: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), k, id, by: u.name });
+      await store.kvSet(key, JSON.stringify(list));
+      return send(res, 200, { ok: true, user: target.name });
+    }
+    if (url === '/api/giftx' && req.method === 'GET') {
+      const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+      let list = []; try { list = JSON.parse(await store.kvGet('gx:' + u.name.toLowerCase()) || '[]'); } catch (e) { list = []; }
+      return send(res, 200, { g: Array.isArray(list) ? list.slice(0, 50) : [] });
+    }
+    if (url === '/api/giftx/ack' && req.method === 'POST') {
+      const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+      const b = await body(req), ids = new Set((Array.isArray(b.ids) ? b.ids : []).map(x => String(x).slice(0, 20))), key = 'gx:' + u.name.toLowerCase();
+      let list = []; try { list = JSON.parse(await store.kvGet(key) || '[]'); } catch (e) { list = []; }
+      list = (Array.isArray(list) ? list : []).filter(g => !ids.has(g.i));
+      if (list.length) await store.kvSet(key, JSON.stringify(list)); else await store.kvDel(key);
+      return send(res, 200, { ok: true, left: list.length });
     }
     if (url === '/api/save') {
       const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
