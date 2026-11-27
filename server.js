@@ -164,6 +164,7 @@ function newRoom(id, name, code) { const r = { id, name, code: code || '', priv:
 function newGeneral() { let n = 1; while (ROOMS.has('general-' + n)) n++; return newRoom('general-' + n, 'GENERAL ' + n, ''); }
 function testRoom() { let r = ROOMS.get('test-room'); if (!r) { r = newRoom('test-room', 'TEST SERVER', ''); r.priv = true; r.test = 1; r.ph = 'play'; r.vend = Infinity; r.evs = {}; } return r; }
 /* Update 9: the capture the flag room. 12 vs 12 on the RIVERCROSS map, flags and score are run by the host's game and only relayed here. Staff only unless CTF_PUBLIC=1 is set on Render. */
+function crRoom(c) { let r = ROOMS.get('cr-' + c.id); if (!r) { r = newRoom('cr-' + c.id, 'CLAN ROOM · ' + c.name.toUpperCase(), ''); r.priv = true; r.cr = c.id; r.map = 'cr'; r.ph = 'play'; r.vend = Infinity; } return r; }
 function ctfRoom() { let r = ROOMS.get('ctf-room'); if (!r) { r = newRoom('ctf-room', 'CAPTURE THE FLAG', ''); r.priv = true; r.ctf = 1; r.map = 'ctf'; r.ph = 'play'; r.vend = Infinity; r.cs = null; } return r; }
 const CTF_MAXT = 12, CTF_MAXP = 24;
 /* Update 9: battle royale lobbies. Players pick a mode (ffa, duo, tri, quad) and a kind (po = players only, nm = normal with bots). The host's game runs the bots and the storm; this only runs the lobby and the teams. */
@@ -217,12 +218,135 @@ function startRound(r) {
   roomOut(r, { t: 'go', map: r.map, rn: r.rn | 0, rw: r.rw || [0, 0] });
 }
 function roomReset(r) { r.t0 = Date.now(); r.sc = [0, 0]; r.evs = {}; for (const o of r.pl.values()) { o.god = 0; o.os = 0; } for (const o of r.pl.values()) { if (!r.pvp) { o.k = 0; o.d = 0; } o.pa = true; } }
+/* ---------- CLANS + RANKED (Update 9) ---------- */
+const CLAN_COST = 20000, CL_NAME = /^[A-Za-z0-9 ]{3,20}$/, CL_TAG = /^[A-Za-z0-9]{2,4}$/, CL_COL = /^#[0-9a-fA-F]{6}$/;
+let CL = { n: 1, c: {} }, RK = { s: 1, end: 0, p: {}, h: [] };
+const CMEM = new Map();                       // lowercase username -> clan id
+let clT = null, rkT = null;
+const clSave = () => { clearTimeout(clT); clT = setTimeout(() => { store.kvSet('clans', JSON.stringify(CL)).catch(() => { }); }, 800); };
+const rkSave = () => { clearTimeout(rkT); rkT = setTimeout(() => { store.kvSet('rank', JSON.stringify(RK)).catch(() => { }); }, 800); };
+const clIndex = () => { CMEM.clear(); for (const c of Object.values(CL.c)) for (const l of Object.keys(c.m)) CMEM.set(l, c.id); };
+const clLevel = xp => 1 + Math.floor(Math.sqrt(Math.max(0, xp) / 400));
+const clNeed = lv => 400 * lv * lv;           // total xp needed to reach level lv+1
+const clMax = lv => Math.min(50, 10 + 5 * (lv - 1));
+const clanOf = n => CL.c[CMEM.get(String(n || '').toLowerCase())] || null;
+const clChip = c => c ? [c.tag, c.col, c.st | 0] : null;
+const clBrief = c => ({ id: c.id, name: c.name, tag: c.tag, col: c.col, st: c.st | 0, open: c.open ? 1 : 0, lv: clLevel(c.xp), xp: c.xp, mem: Object.keys(c.m).length, max: clMax(clLevel(c.xp)), owner: (Object.values(c.m).find(x => x.r === 'L') || {}).n || '', wins: c.w | 0 });
+function clAddXp(c, x, l) { if (!c || !(x > 0)) return; c.xp = Math.min(1e9, (c.xp | 0) + Math.round(x)); if (l && c.m[l]) c.m[l].xp = (c.m[l].xp | 0) + Math.round(x); clSave(); }
+function clDrop(c) { for (const l of Object.keys(c.m)) CMEM.delete(l); delete CL.c[c.id]; store.kvDel('cb:' + c.id).catch(() => { }); clSave(); }
+function clJoin(c, l, n) { for (const o of Object.values(CL.c)) if (o.q) delete o.q[l]; c.m[l] = { n, r: 'M', at: Date.now() }; CMEM.set(l, c.id); clSave(); }
+const clRole = (c, n) => (c.m[String(n).toLowerCase()] || {}).r || '';
+/* ranked: rating, tiers (Bronze..Master), seasons */
+const RK_TIERS = ['BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'DIAMOND', 'MASTER'], RK_START = 300, RK_W = 250, RK_PLACE = 5, SEASON_MS = 28 * 864e5;
+const rkCode = r => { const t = Math.min(5, Math.floor(r / RK_W)); return t === 5 ? 50 : t * 10 + (3 - Math.min(2, Math.floor((r - t * RK_W) / (RK_W / 3)))); };   // tens = tier 0..5, ones = division 3,2,1 (Master: 50)
+const rkOf = n => { const p = RK.p[String(n || '').toLowerCase()]; return p || null; };
+const rkShown = n => { const p = rkOf(n); return p && p.g >= RK_PLACE ? rkCode(p.r) : 0; };
+function rkRoll() {
+  const now = Date.now(); if (!RK.end) { RK.end = now + SEASON_MS; rkSave(); return; }
+  if (now < RK.end) return;
+  const all = Object.entries(RK.p).filter(([, p]) => p.g >= RK_PLACE).sort((a, b) => b[1].r - a[1].r);
+  RK.h = [{ s: RK.s, top: all.slice(0, 10).map(([l, p]) => ({ n: p.n, r: p.r })) }].concat(RK.h || []).slice(0, 6);
+  for (const p of Object.values(RK.p)) { p.pb = p.g >= RK_PLACE ? rkCode(p.r) : 0; p.r = p.r > RK_START ? RK_START + Math.round((p.r - RK_START) * 0.5) : p.r; p.g = 0; p.w = 0; p.l = 0; }
+  RK.s++; RK.end = now + SEASON_MS; rkSave();
+}
+function rkEntry(n) { const l = String(n).toLowerCase(); return RK.p[l] || (RK.p[l] = { n, r: RK_START, g: 0, w: 0, l: 0, pb: 0 }); }
+function rkApply(r, w) {            // r.rkm = [{l,n,tm}], w = winning team
+  if (!r.rkm || w < 0) return [];
+  rkRoll();
+  const avg = t => { const a = r.rkm.filter(x => x.tm === t); return a.length ? a.reduce((s, x) => s + rkEntry(x.n).r, 0) / a.length : RK_START; };
+  const A = [avg(0), avg(1)], out = [];
+  for (const x of r.rkm) { const p = rkEntry(x.n), me = A[x.tm], op = A[1 - x.tm], E = 1 / (1 + Math.pow(10, (op - me) / 400)), S = x.tm === w ? 1 : 0, K = p.g < RK_PLACE ? 48 : 28;
+    let d = Math.round(K * (S - E)); if (S && d < 5) d = 5; if (!S && d > -5) d = -5; const o = p.r; p.r = Math.max(0, p.r + d); p.g++; if (S) p.w++; else p.l++; p.n = x.n; out.push({ n: x.n, d: p.r - o, r: p.r, c: p.g >= RK_PLACE ? rkCode(p.r) : 0, g: p.g }); }
+  rkSave(); return out;
+}
+const rkMe = n => { const p = rkEntry(n); return { r: p.r, g: p.g, w: p.w, l: p.l, place: RK_PLACE, code: p.g >= RK_PLACE ? rkCode(p.r) : 0, prev: p.pb | 0, s: RK.s, left: Math.max(0, RK.end - Date.now()) }; };
+async function clanApi(url, req, res) {
+  const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+  if (isBanned(u.name)) return send(res, 403, { error: BANNED_MSG });
+  const l = u.name.toLowerCase(), cl = clanOf(u.name), role = cl ? clRole(cl, u.name) : '', b = req.method === 'POST' ? await body(req) : {};
+  const err = (m, c) => send(res, c || 400, { error: m });
+  if (url === '/api/clan/list') { const q = decodeURIComponent((req.url.split('q=')[1] || '').split('&')[0]).toLowerCase().slice(0, 20); const a = Object.values(CL.c).filter(c => !q || c.name.toLowerCase().includes(q) || c.tag.toLowerCase().includes(q)).sort((a, b) => b.xp - a.xp).slice(0, 60).map(c => Object.assign(clBrief(c), { req: c.q && c.q[l] ? 1 : 0 })); return send(res, 200, { clans: a, cost: CLAN_COST, mine: cl ? cl.id : 0 }); }
+  if (url === '/api/clan/top') return send(res, 200, { clans: Object.values(CL.c).sort((a, b) => b.xp - a.xp).slice(0, 50).map(clBrief) });
+  if (url === '/api/clan/me') {
+    if (!cl) return send(res, 200, { clan: null, cost: CLAN_COST });
+    const since = Number((req.url.split('since=')[1] || '').split('&')[0]) || 0, lv = clLevel(cl.xp);
+    return send(res, 200, { clan: Object.assign(clBrief(cl), { role, base: clNeed(lv - 1), next: clNeed(lv), m: Object.values(cl.m).sort((a, b) => 'LOM'.indexOf(a.r) - 'LOM'.indexOf(b.r) || a.at - b.at).map(x => ({ n: x.n, r: x.r, x: x.xp | 0 })), q: (role === 'L' || role === 'O') ? Object.values(cl.q || {}).map(x => ({ n: x.n })) : [], chat: (cl.ch || []).filter(x => x.at > since).slice(-60) }) });
+  }
+  if (url === '/api/clan/create' && req.method === 'POST') {
+    if (cl) return err('You are already in a clan. Leave it first.');
+    const name = String(b.name || '').trim().replace(/\s+/g, ' '), tag = String(b.tag || '').trim(), col = CL_COL.test(b.col) ? b.col : '#ffb020', st = Math.max(0, Math.min(7, b.st | 0));
+    if (!CL_NAME.test(name)) return err('Clan name: 3 to 20 letters, numbers or spaces.'); if (!CL_TAG.test(tag)) return err('Clan tag: 2 to 4 letters or numbers.');
+    if (Object.values(CL.c).some(c => c.name.toLowerCase() === name.toLowerCase())) return err('That clan name is taken.'); if (Object.values(CL.c).some(c => c.tag.toLowerCase() === tag.toLowerCase())) return err('That clan tag is taken.');
+    const sv = await store.getSave(u.id); let coins = 0; try { coins = JSON.parse(sv.data).coins | 0; } catch (e) { }
+    if (!isAdmin(u.name) && coins < CLAN_COST) return err('A clan costs ' + CLAN_COST.toLocaleString() + ' coins. You have ' + coins.toLocaleString() + '.');
+    const id = CL.n++; CL.c[id] = { id, name, tag: tag.toUpperCase(), col, st, open: b.open ? 1 : 0, xp: 0, w: 0, m: {}, q: {}, ch: [], at: Date.now() }; clJoin(CL.c[id], l, u.name); CL.c[id].m[l].r = 'L';
+    return send(res, 200, { ok: true, cost: isAdmin(u.name) ? 0 : CLAN_COST, id });
+  }
+  if (url === '/api/clan/join' && req.method === 'POST') {
+    if (cl) return err('You are already in a clan.'); const c = CL.c[b.id | 0]; if (!c) return err('That clan no longer exists.');
+    if (c.open) { if (Object.keys(c.m).length >= clMax(clLevel(c.xp))) return err('That clan is full.'); clJoin(c, l, u.name); return send(res, 200, { ok: true, joined: 1 }); }
+    c.q = c.q || {}; if (Object.keys(c.q).length >= 30) return err('That clan has too many waiting requests.'); c.q[l] = { n: u.name, at: Date.now() }; clSave(); return send(res, 200, { ok: true, requested: 1 });
+  }
+  if (url === '/api/clan/cancel' && req.method === 'POST') { const c = CL.c[b.id | 0]; if (c && c.q) { delete c.q[l]; clSave(); } return send(res, 200, { ok: true }); }
+  if (!cl) return err('You are not in a clan.');
+  if (url === '/api/clan/answer' && req.method === 'POST') {
+    if (role !== 'L' && role !== 'O') return err('Only the leader or officers can answer requests.', 403); const w = String(b.who || '').toLowerCase(), q = cl.q && cl.q[w]; if (!q) return err('That request is gone.');
+    if (!b.ok) { delete cl.q[w]; clSave(); return send(res, 200, { ok: true }); }
+    if (CMEM.has(w)) { delete cl.q[w]; clSave(); return err('That player is already in a clan.'); } if (Object.keys(cl.m).length >= clMax(clLevel(cl.xp))) return err('Your clan is full. Level it up for more room.');
+    clJoin(cl, w, q.n); return send(res, 200, { ok: true });
+  }
+  if (url === '/api/clan/kick' && req.method === 'POST') {
+    const w = String(b.who || '').toLowerCase(), t = cl.m[w]; if (!t || w === l) return err('Pick another member.');
+    if (!(role === 'L' || (role === 'O' && t.r === 'M'))) return err('You cannot kick that member.', 403); delete cl.m[w]; CMEM.delete(w); clSave(); return send(res, 200, { ok: true });
+  }
+  if (url === '/api/clan/role' && req.method === 'POST') { if (role !== 'L') return err('Only the leader can do that.', 403); const w = String(b.who || '').toLowerCase(), t = cl.m[w]; if (!t || w === l || !['O', 'M'].includes(b.r)) return err('Pick another member.'); t.r = b.r; clSave(); return send(res, 200, { ok: true }); }
+  if (url === '/api/clan/settings' && req.method === 'POST') { if (role !== 'L') return err('Only the leader can do that.', 403); if (b.open !== undefined) cl.open = b.open ? 1 : 0; if (CL_COL.test(b.col)) cl.col = b.col; if (b.st !== undefined) cl.st = Math.max(0, Math.min(7, b.st | 0)); clSave(); return send(res, 200, { ok: true }); }
+  if (url === '/api/clan/leave' && req.method === 'POST') {
+    if (role === 'L') {
+      const others = Object.keys(cl.m).filter(x => x !== l);
+      if (!others.length) { clDrop(cl); return send(res, 200, { ok: true, deleted: 1 }); }
+      const to = String(b.to || '').toLowerCase(); if (!cl.m[to] || to === l) return err('Choose who becomes the new leader.');
+      cl.m[to].r = 'L';
+    }
+    delete cl.m[l]; CMEM.delete(l); clSave(); return send(res, 200, { ok: true });
+  }
+  if (url === '/api/clan/board') {
+    if (req.method === 'GET') { let o = null; try { o = JSON.parse(await store.kvGet('cb:' + cl.id) || 'null'); } catch (e) { } return send(res, 200, { s: o ? o.s : [], at: o ? o.at : 0 }); }
+    if (req.method === 'POST') {
+      const s = Array.isArray(b.s) ? b.s.slice(0, 400) : null; if (!s) return err('Bad board.');
+      const out = []; let pts = 0;
+      for (const k of s) { if (!k || typeof k !== 'object' || !Array.isArray(k.p)) continue; const col = k.c === 'e' ? 'e' : /^#[0-9a-fA-F]{6}$/.test(k.c) ? k.c : '#ffffff', w = Math.max(1, Math.min(40, k.w | 0 || 3)), p = k.p.slice(0, 3000).map(n => Math.max(0, Math.min(1000, Math.round(Number(n) || 0)))); pts += p.length; if (pts > 40000) break; out.push({ c: col, w, p }); }
+      const o = { s: out, at: Date.now() }; await store.kvSet('cb:' + cl.id, JSON.stringify(o)); return send(res, 200, { ok: true, at: o.at });
+    }
+  }
+  if (url === '/api/clan/delete' && req.method === 'POST') { if (role !== 'L') return err('Only the leader can delete the clan.', 403); if (b.sure !== 1) return err('Please confirm.'); clDrop(cl); return send(res, 200, { ok: true }); }
+  if (url === '/api/clan/chat' && req.method === 'POST') {
+    const t = String(b.t || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 200); if (!t) return err('Empty message.'); const now = Date.now(); const m = cl.m[l]; if (m.lc && now - m.lc < 800) return err('Slow down.', 429); m.lc = now;
+    cl.ch = cl.ch || []; cl.ch.push({ n: u.name, t, at: now }); if (cl.ch.length > 100) cl.ch.splice(0, cl.ch.length - 100); clSave(); return send(res, 200, { ok: true, at: now });
+  }
+  return err('Not found', 404);
+}
+async function rankApi(url, req, res) {
+  rkRoll();
+  if (url === '/api/rank/top') { const a = Object.values(RK.p).filter(p => p.g >= RK_PLACE).sort((a, b) => b.r - a.r).slice(0, 50).map(p => ({ n: p.n, r: p.r, c: rkCode(p.r), w: p.w, l: p.l })); return send(res, 200, { top: a, s: RK.s, left: Math.max(0, RK.end - Date.now()), hist: RK.h || [] }); }
+  const u = await auth(req); if (!u) return send(res, 401, { error: 'Please log in again.' });
+  if (url === '/api/rank/me') return send(res, 200, rkMe(u.name));
+  return send(res, 404, { error: 'Not found' });
+}
 /* ---------- PvP queues: 1v1 / 2v2 / 3v3, no bots, one life per round, first to 3 round wins ---------- */
 const PVP_RT = Number(process.env.PVP_RT) || 120000, PVP_BREAK = Number(process.env.PVP_BREAK) || 10000, PVP_WINS = 3, PVP_MAXR = 9;
 let pvpN = 0;
-function pvpRoom(n) {
-  for (const r of ROOMS.values()) if (r.pvp === n && r.ph === 'wait' && r.pl.size < 2 * n) return r;
-  const r = newRoom('pvp-' + (++pvpN), 'PVP ' + n + 'V' + n, ''); r.pvp = n; r.map = 'arena'; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; return r;
+function pvpRoom(n, o) {
+  o = o || {};
+  for (const r of ROOMS.values()) {
+    if (r.pvp !== n || r.ph !== 'wait' || r.pl.size >= 2 * n) continue;
+    if (o.clw) { if (!r.clw) continue; const tc = tcOf(r); if (r.clw[1] && !tc[1]) r.clw[1] = 0; if (r.clw[0] === o.clw) { if (tc[0] < n) return r; } else if (r.clw[1] === o.clw) { if (tc[1] < n) return r; } else if (!r.clw[1] && tc[1] === 0) { r.clw[1] = o.clw; return r; } continue; }
+    if (r.clw) continue;
+    if (o.rk) { if (!r.rk) continue; const rs = [...r.pl.values()].map(x => x.rt | 0), avg = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : o.rt, band = Math.min(2000, 200 + Math.floor((Date.now() - r.t0) / 1000) * 10); if (Math.abs(avg - o.rt) > band) continue; return r; }
+    if (r.rk) continue;
+    return r;
+  }
+  const r = newRoom('pvp-' + (++pvpN), (o.rk ? 'RANKED ' : o.clw ? 'CLAN WAR ' : 'PVP ') + n + 'V' + n, ''); r.pvp = n; r.map = 'arena'; r.priv = true; r.ph = 'wait'; r.rw = [0, 0]; r.rn = 0; if (o.rk) r.rk = 1; if (o.clw) r.clw = [o.clw, 0]; return r;
 }
 const pvpAlive = (r, t) => { let n = 0; for (const o of r.pl.values()) if (o.tm === t && o.pa) n++; return n; };
 function pvpEnd(r, win, force) {
@@ -231,7 +355,8 @@ function pvpEnd(r, win, force) {
   const fin = force || (win >= 0 && r.rw[win] >= PVP_WINS) || r.rn >= PVP_MAXR;
   if (fin) {
     const w = r.rw[0] > r.rw[1] ? 0 : r.rw[1] > r.rw[0] ? 1 : -1;
-    roomOut(r, { t: 'end', win: w, sc: r.rw, lb: lbOf(r), rs: 0, vl: 0, pvp: 1, fin: 1, rw: r.rw, rn: r.rn }); r.ph = 'done'; setTimeout(() => { for (const c of [...r.pl.values()]) wsDrop(c); }, 120000).unref();
+    let rkr = []; try { if (r.rk) rkr = rkApply(r, w); if (r.clw && w >= 0 && r.rkm) { const wc = CL.c[r.clw[w]], lc = CL.c[r.clw[1 - w]]; if (wc) { clAddXp(wc, 400); wc.w = (wc.w | 0) + 1; } if (lc) clAddXp(lc, 100); } } catch (e) { console.error('rk', e.message); }
+    roomOut(r, { t: 'end', win: w, sc: r.rw, lb: lbOf(r), rs: 0, vl: 0, pvp: 1, fin: 1, rw: r.rw, rn: r.rn, rk: rkr, cw: r.clw ? 1 : 0 }); r.ph = 'done'; setTimeout(() => { for (const c of [...r.pl.values()]) wsDrop(c); }, 120000).unref();
   } else {
     roomOut(r, { t: 'end', win, sc: r.rw, lb: lbOf(r), rs: PVP_BREAK, vl: 0, pvp: 1, fin: 0, rw: r.rw, rn: r.rn }); r.ph = 'break'; r.vend = Date.now() + PVP_BREAK;
   }
@@ -252,7 +377,7 @@ function coRoom() {
 function coWipe(r) { if (!r.co || r.ph !== 'play') return; r.ph = 'break'; r.vend = Date.now() + 5000; roomOut(r, { t: 'cx', w: r.cw | 0 }); }
 function coCheck(r) { if (!r.co || r.ph !== 'play' || !r.pl.size) return; for (const o of r.pl.values()) if (o.pa) return; coWipe(r); }
 function pvpQ(r) { roomOut(r, { t: 'pq', have: r.pl.size, need: 2 * r.pvp, names: [...r.pl.values()].map(o => o.name) }); }
-function pvpFull(r) { r.ph = 'vote'; r.vend = Date.now() + VOTE_MS; r.votes.clear(); r.rw = [0, 0]; r.rn = 0; roomOut(r, { t: 'pv', vl: VOTE_MS, need: 2 * r.pvp }); }
+function pvpFull(r) { r.rkm = [...r.pl.values()].map(o => ({ n: o.name, tm: o.tm })); r.ph = 'vote'; r.vend = Date.now() + VOTE_MS; r.votes.clear(); r.rw = [0, 0]; r.rn = 0; roomOut(r, { t: 'pv', vl: VOTE_MS, need: 2 * r.pvp }); }
 function wsDrop(c) {
   if (c.dead) return; c.dead = true; try { c.sock.destroy(); } catch (e) { }
   if (c.user) { if (USERS.get(c.user.id) === c) USERS.delete(c.user.id); if (SOLOS.get(c.user.id) === c) SOLOS.delete(c.user.id); }
@@ -320,25 +445,30 @@ function wsMsg(c, m) {
         return wsOut(c, { t: 'w', id: -1, spec: 1, room: sr.id, name: sr.name, priv: 0, code: '', co: sr.co ? 1 : 0, cw: sr.cw | 0, host: sr.host, tm: 0, pl: sl, tc: tcOf(sr), el: Date.now() - sr.t0, sc: sr.sc, lb: lbOf(sr), map: sr.map, ph: sr.ph, vl: Math.max(0, sr.vend - Date.now()), vt: vcount(sr), pvp: sr.pvp | 0, need: sr.pvp ? 2 * sr.pvp : 0, rw: sr.rw || [0, 0], rn: sr.rn | 0 });
       }
       let r = null;
-      if (m.ctf) { if (process.env.CTF_PRIVATE === '1' && !roleOf(u.name)) return soft('Capture the flag is only open to testers and developers right now.'); r = ctfRoom(); }
+      if (m.cr) { const mc = clanOf(u.name); if (!mc) return soft('Join a clan to enter its room.'); r = crRoom(mc); }
+      else if (m.ctf) { if (process.env.CTF_PRIVATE === '1' && !roleOf(u.name)) return soft('Capture the flag is only open to testers and developers right now.'); r = ctfRoom(); }
       else if (m.br && typeof m.br === 'object') { r = brRoom(String(m.br.m || ''), String(m.br.k || '')); }
       else if (m.test) { if (!roleOf(u.name)) return soft('The test server is only for testers and developers.'); r = testRoom(); }
       else if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
       else if (m.room) { r = ROOMS.get(String(m.room).slice(0, 40)); if (!r || r.priv) return soft('That server no longer exists.'); }
       else if (m.co) r = coRoom();
-      else if (m.pvp) { const pn = m.pvp | 0; if (![1, 2, 3].includes(pn)) return soft('Pick 1v1, 2v2 or 3v3.'); r = pvpRoom(pn); }
+      else if (m.pvp || m.cwn) {
+        const pn = (m.cwn || m.pvp) | 0;
+        if (m.cwn) { if (![1, 2, 3, 4, 5, 6].includes(pn)) return soft('Pick 1v1 to 6v6.'); const mc = clanOf(u.name); if (!mc) return soft('Join a clan first to play Clan Wars.'); r = pvpRoom(pn, { clw: mc.id }); }
+        else { if (![1, 2, 3].includes(pn)) return soft('Pick 1v1, 2v2 or 3v3.'); r = m.rk ? pvpRoom(pn, { rk: 1, rt: rkEntry(u.name).r }) : pvpRoom(pn); }
+      }
       else r = findRoom(team);
       if (r.pl.size >= (r.co ? COMAX : r.ctf ? CTF_MAXP : r.br ? 12 : MAXP)) { if (m.create) ROOMS.delete(r.id); return soft('That server is full.'); }
       if (old && old !== c && !adm) { wsOut(old, { t: 'err', m: 'You joined from another place.' }); wsDrop(old); }
       const pid = r.nextId++;
-      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = (r.co || r.br) ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < (r.ctf ? CTF_MAXT : MAXT) ? team : 1 - team); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.role = roleOf(u.name); c.pr = pr; c.fx = fx; c.k = 0; c.d = 0;
+      c.user = u; USERS.set(u.id, c); c.room = r; c.pid = pid; c.tm = (r.co || r.br || r.cr) ? 0 : r.pvp ? (tcOf(r)[0] <= tcOf(r)[1] ? 0 : 1) : (tcOf(r)[team] < (r.ctf ? CTF_MAXT : MAXT) ? team : 1 - team); if (r.clw) { const mc = clanOf(u.name); c.tm = mc && r.clw[0] === mc.id ? 0 : 1; } c.rt = rkEntry(u.name).r; c.rkc = rkShown(u.name); c.pa = true; c.name = u.name; c.ch = Math.max(0, Math.min(99, m.ch | 0)); c.admin = adm; c.role = roleOf(u.name); c.pr = pr; c.fx = fx; c.k = 0; c.d = 0;
       if (!r.host) { r.host = pid; r.hs = Date.now(); }
-      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0, fx: o.fx || '' }));
+      const list = [...r.pl.values()].map(o => ({ id: o.pid, n: o.name, tm: o.tm, ch: o.ch, pr: o.pr | 0, fx: o.fx || '', rk: o.rkc | 0 }));
       r.pl.set(pid, c);
-      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0, role: c.role, test: r.test ? 1 : 0, ctf: r.ctf ? 1 : 0, br: r.br ? { m: r.bm, k: r.bk, ph: r.bph } : 0, cs: r.cs || null });
+      wsOut(c, { t: 'w', id: pid, room: r.id, name: r.name, priv: (r.priv && r.code) ? 1 : 0, code: r.code, co: r.co ? 1 : 0, cw: r.cw | 0, host: r.host, tm: c.tm, pl: list, tc: tcOf(r), el: Date.now() - r.t0, sc: r.sc, lb: lbOf(r), map: r.map, ph: r.ph, vl: Math.max(0, r.vend - Date.now()), vt: vcount(r), pvp: r.pvp | 0, need: r.pvp ? 2 * r.pvp : 0, rw: r.rw || [0, 0], rn: r.rn | 0, role: c.role, test: r.test ? 1 : 0, ctf: r.ctf ? 1 : 0, cr: r.cr ? 1 : 0, br: r.br ? { m: r.bm, k: r.bk, ph: r.bph } : 0, cs: r.cs || null });
       if (r.evs && Object.keys(r.evs).length) wsOut(c, { t: 'acs', evs: r.evs });
-      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0, fx: c.fx || '' } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
+      roomOut(r, { t: 'pj', p: { id: pid, n: c.name, tm: c.tm, ch: c.ch, pr: c.pr | 0, fx: c.fx || '', rk: c.rkc | 0 } }, c); roomOut(r, { t: 'tc', tc: tcOf(r) });
       if (r.pvp && r.ph === 'wait') { pvpQ(r); if (r.pl.size >= 2 * r.pvp) pvpFull(r); }
     }).catch(() => wsDrop(c));
     return;
@@ -414,11 +544,12 @@ function wsMsg(c, m) {
   } else if (m.t === 'c') {
     const tx = cleanChat(String(m.m || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120));
     if (!tx || now - (c.lc || 0) < 700) return; c.lc = now;
-    roomOut(r, { t: 'c', i: c.pid, n: c.name, tm: c.tm, m: tx });
+    roomOut(r, { t: 'c', i: c.pid, n: c.name, tm: c.tm, m: tx, k: c.rkc | 0 });
   } else if (m.t === 'hit') {
     /* hits are spaced 12 ms apart, except that one shotgun volley (up to 10 pellets) arrives at once and every pellet counts */
     if (now - c.lh < 12) { if ((c.lb = (c.lb || 0) + 1) > 10) return; } else { c.lh = now; c.lb = 1; }
     if (r.pvp && r.ph !== 'play') return;
+    if (r.cr) return;
     const v = r.pl.get(m.to | 0), d = Math.round(Number(m.d));
     if (!v || v === c || (v.tm === c.tm && !r.test) || !(d >= 1 && d <= (r.pvp ? 500 : 1000))) return;
     let dd = d;
@@ -478,7 +609,7 @@ setInterval(() => {
   const n = Date.now();
   for (const r of ROOMS.values()) {
    try {
-    if (r.solo || r.test || r.ctf || r.br) continue;
+    if (r.solo || r.test || r.ctf || r.br || r.cr) continue;
     if (r.co) { if ((r.ph === 'vote' || r.ph === 'break') && n >= r.vend) startRound(r); continue; }
     if (r.pvp) {
       if (r.ph === 'play' && n - r.t0 >= PVP_RT) { const a0 = pvpAlive(r, 0), a1 = pvpAlive(r, 1); pvpEnd(r, a0 > a1 ? 0 : a1 > a0 ? 1 : r.sc[0] > r.sc[1] ? 0 : r.sc[1] > r.sc[0] ? 1 : -1); }
@@ -562,7 +693,7 @@ const server = http.createServer(async (req, res) => {
       if (t - last.t < 1500) return send(res, 429, { error: 'Slow down a little.' });
       if (last.m === tx && t - last.t < 15000) return send(res, 429, { error: 'You just said that.' });
       GC_LAST.set(k, { t, m: tx }); if (GC_LAST.size > 5000) GC_LAST.delete(GC_LAST.keys().next().value);
-      const m = { id: ++gcSeq, n: u.name, m: tx, ts: t, a: isAdmin(u.name) ? 1 : 0 };
+      const m = { id: ++gcSeq, n: u.name, m: tx, ts: t, a: isAdmin(u.name) ? 1 : 0, k: rkShown(u.name) };
       GCHAT.push(m); while (GCHAT.length > 100) GCHAT.shift();
       return send(res, 200, { ok: true, id: m.id });
     }
@@ -623,10 +754,12 @@ const server = http.createServer(async (req, res) => {
       const list = EVS.filter(e => (since >= 0 ? e.seq > since : now - e.ts < 15000) && now - e.ts < 60000).map(e => ({ seq: e.seq, id: e.id, type: e.type, data: e.data, age: now - e.ts }));
       return send(res, 200, { seq: evSeq, events: list });
     }
+    if (url.startsWith('/api/clan/')) return clanApi(url, req, res);
+    if (url.startsWith('/api/rank/')) return rankApi(url, req, res);
     if (url === '/api/leaderboard' && req.method === 'GET') {
       const day = dayKey(), nowt = Date.now();
       if (!lbCache || lbCache.day !== day || nowt - lbCacheAt > 20000) { lbCache = { day, g: (await store.lbTop(100 + BANS.size)).filter(x => !isBanned(x.n)).slice(0, 100), d: (await store.lbDay(day, 10 + BANS.size)).filter(x => !isBanned(x.n)).slice(0, 10) }; lbCacheAt = nowt; }
-      const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), d: lbCache.d.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n) })), me: null };
+      const out = { day, g: lbCache.g.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n), c: clChip(clanOf(x.n)), k: rkShown(x.n) })), d: lbCache.d.map(x => ({ n: x.n, p: x.p, t: titleOf(x.n), c: clChip(clanOf(x.n)), k: rkShown(x.n) })), me: null };
       const u = await auth(req); if (u && !isBanned(u.name)) out.me = await store.lbMe(u.id, day);
       return send(res, 200, out);
     }
@@ -721,6 +854,7 @@ const server = http.createServer(async (req, res) => {
         const now = Date.now(), prev = await store.getSave(u.id), upd = Math.min(Number(b.upd) || now, now + 60000);
         if (!isAdmin(u.name) && !plausible(save, prev, now)) return send(res, 422, { error: 'That save has progress that is not possible, so your last valid progress was restored.', save: prev ? JSON.parse(prev.data) : null, upd: prev ? prev.upd : 0 });
         await store.putSave(u.id, JSON.stringify(save), upd, now);
+        try { const cc = clanOf(u.name); if (cc && prev) { const op = JSON.parse(prev.data), dx = totalXP(save.lvl | 0 || 1, save.xp | 0) - totalXP(op.lvl | 0 || 1, op.xp | 0); if (dx > 0 && dx <= 20000) clAddXp(cc, dx, u.name.toLowerCase()); } } catch (e) { }
         try { const np = Math.max(0, Math.round(save.pts || 0)), op = prev ? Math.max(0, Math.round(JSON.parse(prev.data).pts || 0)) : np; await store.lbSet(u.id, u.name, np, Math.max(0, Math.min(np - op, 200000)), dayKey()); lbCache = null; } catch (e) { console.error('lb', e.message); }
         return send(res, 200, { ok: true, upd });
       }
@@ -740,5 +874,5 @@ server.on('upgrade', (req, sock, head) => {
     wsOpen(sock, head);
   } catch (e) { try { sock.destroy(); } catch (x) { } }
 });
-store.init().then(async () => { try { for (const n of JSON.parse(await store.kvGet('bans') || '[]')) BANS.add(String(n).toLowerCase()); for (const n of ['nate', 'nihdih']) if (!(await store.kvGet('autoreset1:' + n))) { const r = await resetUser(n); console.log('reset', n, r ? 'done' : 'no such user yet'); if (r) await store.kvSet('autoreset1:' + n, '1'); } } catch (e) { console.error('boot', e.message); } for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); try { const l = JSON.parse(await store.kvGet('live') || 'null'); if (l && typeof l.n === 'string' && Number.isFinite(l.end)) LIVE = l; } catch (e) { } }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
+store.init().then(async () => { try { for (const n of JSON.parse(await store.kvGet('bans') || '[]')) BANS.add(String(n).toLowerCase()); for (const n of ['nate', 'nihdih']) if (!(await store.kvGet('autoreset1:' + n))) { const r = await resetUser(n); console.log('reset', n, r ? 'done' : 'no such user yet'); if (r) await store.kvSet('autoreset1:' + n, '1'); } } catch (e) { console.error('boot', e.message); } try { const c0 = JSON.parse(await store.kvGet('clans') || 'null'); if (c0 && c0.c) { CL = c0; clIndex(); } const r0 = JSON.parse(await store.kvGet('rank') || 'null'); if (r0 && r0.p) RK = r0; rkRoll(); } catch (e) { console.error('clan boot', e.message); } for (const r of await store.titlesAll()) TITLES.set(r.lname, { n: r.name, t: r.txt, c: r.col }); try { const l = JSON.parse(await store.kvGet('live') || 'null'); if (l && typeof l.n === 'string' && Number.isFinite(l.end)) LIVE = l; } catch (e) { } }).then(() => server.listen(PORT, () => console.log('STRIKEZONE server on port ' + PORT + ' (' + (process.env.DATABASE_URL ? 'postgres' : 'file storage') + ')')))
   .catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
