@@ -292,7 +292,7 @@ function wsMsg(c, m) {
         return wsOut(c, { t: 'w', id: -1, spec: 1, room: sr.id, name: sr.name, priv: 0, code: '', co: sr.co ? 1 : 0, cw: sr.cw | 0, host: sr.host, tm: 0, pl: sl, tc: tcOf(sr), el: Date.now() - sr.t0, sc: sr.sc, lb: lbOf(sr), map: sr.map, ph: sr.ph, vl: Math.max(0, sr.vend - Date.now()), vt: vcount(sr), pvp: sr.pvp | 0, need: sr.pvp ? 2 * sr.pvp : 0, rw: sr.rw || [0, 0], rn: sr.rn | 0 });
       }
       let r = null;
-      if (m.ctf) { if (!roleOf(u.name) && process.env.CTF_PUBLIC !== '1') return soft('Capture the flag is only open to testers and developers for now.'); r = ctfRoom(); }
+      if (m.ctf) { if (process.env.CTF_PRIVATE === '1' && !roleOf(u.name)) return soft('Capture the flag is only open to testers and developers right now.'); r = ctfRoom(); }
       else if (m.test) { if (!roleOf(u.name)) return soft('The test server is only for testers and developers.'); r = testRoom(); }
       else if (m.create) { let code = String(m.code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (m.code && (code.length < 3 || code.length > 10)) return soft('The code must be 3 to 10 letters or numbers.'); if (code && CODES.has(code)) return soft('That code is already taken. Choose another one.'); if (!code) code = newCode(); if (!code) return soft('Could not make a private server. Try again.'); r = newRoom('private-' + code, 'PRIVATE ' + code, code); if (m.co) { r.co = 1; r.cw = 0; r.name = 'CO-OP ' + code; } }
       else if (m.code) { r = CODES.get(String(m.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)); if (!r) return soft('No private server has that code.'); }
